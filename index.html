@@ -473,6 +473,11 @@ h4.hd:first-child{margin-top:0}
 @media (max-width:900px){ #modal.light{padding-bottom:96px} }
 #modal.light .dlg{border-color:rgba(216,178,106,.5);box-shadow:0 0 0 1px rgba(0,0,0,.5),0 26px 70px rgba(0,0,0,.75)}
 #modal.over{z-index:500}
+/* облако: под этим входом играют на другом устройстве — здесь всё закрыто (src/p10_cloud.js) */
+#cloudLock{position:fixed;inset:0;background:rgba(4,10,12,.88);display:none;align-items:center;
+  justify-content:center;z-index:2000;padding:16px;backdrop-filter:blur(4px)}
+#cloudLock.on{display:flex}
+#cloudLock .dlg{max-width:440px}
 #splash{position:fixed;inset:0;background:rgba(4,10,12,.82);display:none;align-items:center;
   justify-content:center;z-index:400;padding:16px;backdrop-filter:blur(4px)}
 #splash.on{display:flex}
@@ -9852,6 +9857,240 @@ var UI = (function () {
   };
 })();
 
+
+/* ============================================================
+   ОБЛАКО: вход через Google (или почту) и один профиль на всех устройствах.
+   Тот же проект Firebase и тот же вход, что в «Колдовстве» и «Клаборе»:
+   зашёл одним Google-аккаунтом — и там и тут это ты.
+   Где лежит:  users/{uid}/pref/profile — профиль той же строкой, что
+               «Профиль строкой» (имя, портрет, характер, номер игрока,
+               открытые портреты, секреты, статистика);
+               users/{uid}/pref/session — кто сейчас играет под этим входом.
+   Правила Firestore уже пускают в users/{uid}/** только самого игрока.
+   Вход:  облачный профиль СЛИВАЕТСЯ с местным (портреты и секреты
+          складываются, статистика — где партий больше; имя, портрет и номер
+          игрока берутся из облака), и общий итог уезжает обратно.
+   Дважды с одного профиля нельзя (просьба Ника): открыл игру под тем же
+   входом на другом устройстве — здесь игра закрывается окном «Под этим
+   входом играют на другом устройстве», сетевой стол и комната
+   покидаются. Кнопка «Играть здесь» забирает игру назад.
+   За одним сетевым столом то же самое держит номер игрока: он теперь общий
+   на все устройства одного входа, а стол два одинаковых номера не сажает.
+   Без входа игра живёт как раньше — только в этом браузере.
+   ============================================================ */
+var Cloud = (function () {
+  'use strict';
+  var CFG = {
+    apiKey: 'AIzaSyAt_vYZguVNF0yJLv_S-i5ZfifnzutIEg0',
+    authDomain: (typeof location !== 'undefined' && location.hostname === 'malefictum.github.io')
+      ? 'malefictum.github.io' : 'witchcraft-rpg.firebaseapp.com',
+    projectId: 'witchcraft-rpg', storageBucket: 'witchcraft-rpg.firebasestorage.app',
+    messagingSenderId: '677124111014', appId: '1:677124111014:web:45788ee3415822ba571267'
+  };
+  var SDK = 'https://www.gstatic.com/firebasejs/10.12.2/firebase-';
+  var ON = 'pref-cloud-on';
+  var C = { user: null, state: 'off', err: '', at: 0, owner: false, kicked: false, kickFrom: '', busy: false };
+  var listeners = [];
+  function emit() { listeners.forEach(function (f) { try { f(C); } catch (e) { } }); }
+  function ls(k, v) {
+    try {
+      if (v === undefined) return localStorage.getItem(k);
+      if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v);
+    } catch (e) { }
+    return null;
+  }
+  function from() { return (navigator.userAgent || '').slice(0, 80); }
+  var SID = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+
+  var ERR = {
+    'auth/invalid-credential': 'почта или пароль не подходят', 'auth/wrong-password': 'пароль не подходит',
+    'auth/user-not-found': 'такой почты нет — создайте вход', 'auth/invalid-email': 'почта записана с ошибкой',
+    'auth/email-already-in-use': 'эта почта уже занята — войдите', 'auth/weak-password': 'пароль слишком простой — от 6 знаков',
+    'auth/popup-blocked': 'браузер не дал открыть окно Google — разрешите всплывающие окна',
+    'auth/popup-closed-by-user': 'окно входа закрыто', 'auth/cancelled-popup-request': 'окно входа закрыто',
+    'auth/network-request-failed': 'нет связи', 'auth/unauthorized-domain': 'этот сайт облаку не знаком',
+    'auth/too-many-requests': 'слишком много попыток — подождите немного',
+    'permission-denied': 'облако не пустило', 'unavailable': 'облако недоступно — нет связи'
+  };
+  function msg(e) { return (e && ERR[e.code]) || (e && e.message) || 'что-то пошло не так'; }
+
+  /* ---------- Firebase грузим только по требованию ---------- */
+  function script(src) {
+    return new Promise(function (ok, no) {
+      var s = document.createElement('script'); s.src = src; s.onload = ok;
+      s.onerror = function () { no(new Error('нет связи с облаком')); };
+      document.head.appendChild(s);
+    });
+  }
+  var ready = null, auth = null, db = null;
+  function load() {
+    if (ready) return ready;
+    ready = (function () {
+      var p = Promise.resolve();
+      if (!window.firebase) ['app', 'auth', 'firestore'].forEach(function (m) {
+        p = p.then(function () { return script(SDK + m + '-compat.js'); });
+      });
+      return p.then(function () {
+        if (!window.firebase || !firebase.initializeApp) throw new Error('облако здесь недоступно');
+        var app = firebase.apps.length ? firebase.app() : firebase.initializeApp(CFG);
+        auth = app.auth(); db = app.firestore();
+        return auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(function () { });
+      }).then(function () {
+        auth.onAuthStateChanged(function (u) {
+          if (u && u.isAnonymous) u = null;   // анонимный вход (сдача дня в бридже) — это не «вошли»
+          C.user = u ? { uid: u.uid, name: u.displayName || '', email: u.email || '' } : null;
+          C.state = u ? 'in' : 'off';
+          if (u) {
+            ls(ON, '1');
+            claim().catch(function (e) { C.err = msg(e); emit(); });
+          } else { unwatch(); C.owner = false; }
+          emit();
+        });
+      });
+    })().catch(function (e) { ready = null; throw e; });
+    return ready;
+  }
+  function run(f) {
+    C.err = ''; C.state = 'wait'; emit();
+    return load().then(f).then(function (r) {
+      C.state = C.user ? 'in' : 'off'; emit(); return r;
+    }).catch(function (e) {
+      C.err = msg(e); C.state = C.user ? 'in' : 'off'; emit(); throw new Error(C.err);
+    });
+  }
+
+  /* ---------- профиль ---------- */
+  function base() { return db.collection('users').doc(C.user.uid).collection('pref'); }
+  function pRef() { return base().doc('profile'); }
+  function sRef() { return base().doc('session'); }
+
+  // отпечаток того, что уезжает в облако: поменялся — пора отправить
+  function print() { try { return Boot.exportText(); } catch (e) { return sent; } }
+  var sent = '';
+  function push() {
+    if (!C.user || !C.owner || C.kicked || C.busy) return Promise.resolve();
+    var fp = print(), text; C.busy = true;
+    try { text = Boot.exportText(); } catch (e) { C.busy = false; return Promise.resolve(); }
+    return pRef().set({ text: text, t: Date.now(), from: from() })
+      .then(function () { sent = fp; C.at = Date.now(); C.err = ''; })
+      .catch(function (e) { C.err = msg(e); })
+      .then(function () { C.busy = false; emit(); });
+  }
+  // при входе: облачное сливаем со здешним, общий итог отправляем назад
+  function pull() {
+    return pRef().get().then(function (snap) {
+      var d = snap.data();
+      if (d && d.text) {
+        try { (function (r) { if (!r.ok) throw new Error(r.why); })(Boot.importText(d.text, true)); } catch (e) { C.err = 'облачный профиль не читается: ' + (e.message || e); }
+      }
+      return push();
+    });
+  }
+  // меняется редко (конец раздачи, новый портрет, имя) — проверяем раз в несколько секунд
+  setInterval(function () { if (C.user && C.owner && !C.kicked && print() !== sent) push(); }, 5000);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden' && C.user && C.owner && !C.kicked && print() !== sent) push();
+  });
+
+  /* ---------- одна игра на вход: кто открыл последним, тот и играет ---------- */
+  var unsub = null;
+  function unwatch() { if (unsub) { try { unsub(); } catch (e) { } unsub = null; } }
+  function watch() {
+    unwatch();
+    unsub = sRef().onSnapshot(function (snap) {
+      var d = snap.data();
+      if (!d || d.id === SID || !C.owner) return;
+      kick(d);
+    }, function () { });
+  }
+  function kick(d) {
+    var was = print() !== sent;
+    var p = was ? push() : Promise.resolve();   // дописали своё — и отдали
+    C.owner = false; C.kicked = true; C.kickFrom = d.from || ''; unwatch();
+    p.then(function () { return sRef().update({ releasedPrev: true }); }).catch(function () { });
+    // за сетевым столом и в комнате второй раз сидеть нельзя
+    try { if (typeof Net !== 'undefined' && Net.S && Net.S.on) Net.leave(); } catch (e) { }
+    try { if (typeof Hall !== 'undefined' && Hall.leave) Hall.leave(); } catch (e) { }
+    lock(); emit();
+  }
+  function claim() {
+    if (!C.user) return Promise.resolve();
+    return sRef().get().then(function (snap) {
+      var cur = snap.data();
+      return sRef().set({ id: SID, at: Date.now(), from: from(), released: false, releasedPrev: false }).then(function () {
+        C.owner = true; C.kicked = false; unlock(); emit();
+        // там ещё играют — даём до 4 с дописать сохранение
+        if (cur && cur.id && cur.id !== SID && !cur.released) return waitPrev(8);
+      });
+    }).then(function () { watch(); return pull(); });
+  }
+  function waitPrev(n) {
+    if (n <= 0) return Promise.resolve();
+    return new Promise(function (r) { setTimeout(r, 500); })
+      .then(function () { return sRef().get(); })
+      .then(function (s) { var d = s.data(); if (!d || d.releasedPrev || d.id !== SID) return; return waitPrev(n - 1); });
+  }
+  window.addEventListener('pagehide', function () {
+    if (C.owner && C.user) { try { sRef().update({ released: true }); } catch (e) { } }
+  });
+
+  /* ---------- окно «играют на другом устройстве» ---------- */
+  function lock() {
+    var el = document.getElementById('cloudLock');
+    if (!el) { el = document.createElement('div'); el.id = 'cloudLock'; document.body.appendChild(el); }
+    el.innerHTML = '<div class="dlg"><h3>Играют на другом устройстве</h3>' +
+      '<div class="sub">Под этим входом' + (C.user && C.user.email ? ' (' + esc(C.user.email) + ')' : '') +
+      ' преферанс только что открыли в другом месте. Играть с одного профиля в двух местах сразу нельзя — ' +
+      'здесь игра остановлена, всё наигранное уже в облаке.</div>' +
+      '<div class="row"><button class="btn pri wide" data-cl="here">Играть здесь</button></div>' +
+      '<div class="row"><button class="btn wide" data-cl="out">Выйти из профиля</button></div></div>';
+    el.classList.add('on');
+    el.onclick = function (ev) {
+      var b = ev.target.closest('[data-cl]'); if (!b) return;
+      if (b.dataset.cl === 'here') claim().catch(function (e) { UI.toast('Облако: ' + msg(e)); });
+      else signOut();
+    };
+  }
+  function unlock() { var el = document.getElementById('cloudLock'); if (el) el.classList.remove('on'); }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+  /* ---------- вход и выход ---------- */
+  function signOut() {
+    return run(function () {
+      var p = (C.owner && print() !== sent) ? push() : Promise.resolve();
+      return p.then(function () {
+        if (C.owner) return sRef().update({ released: true }).catch(function () { });
+      }).then(function () {
+        unwatch(); C.owner = false; C.kicked = false; unlock(); ls(ON, null); sent = '';
+        return auth.signOut();
+      });
+    });
+  }
+
+  // был вход раньше — поднимаемся сами
+  if (ls(ON)) setTimeout(function () { load().catch(function (e) { C.err = msg(e); emit(); }); }, 400);
+
+  C.on = function (f) { listeners.push(f); };
+  /* select_account: Google каждый раз спрашивает, каким аккаунтом войти, —
+     иначе сменить почту (выйти и войти другой) было бы нельзя: он молча
+     пускал бы под прежней. */
+  C.google = function () {
+    return run(function () {
+      var pr = new firebase.auth.GoogleAuthProvider();
+      try { pr.setCustomParameters({ prompt: 'select_account' }); } catch (e) { }
+      return auth.signInWithPopup(pr);
+    });
+  };
+  C.signIn = function (e, p) { return run(function () { return auth.signInWithEmailAndPassword(e, p); }); };
+  C.signUp = function (e, p) { return run(function () { return auth.createUserWithEmailAndPassword(e, p); }); };
+  C.reset = function (e) { return run(function () { return auth.sendPasswordResetEmail(e); }); };
+  C.signOut = signOut;
+  C.push = push;
+  C.msg = msg;
+  C.SID = SID;
+  return C;
+})();
+
 /* ============================================================
    ОДЕССКИЙ ПРЕФЕРАНС — меню, профиль, запуск
 
@@ -9872,7 +10111,7 @@ var Boot = (function () {
      в клаборе: чтобы с одного взгляда было видно, КАКАЯ версия сейчас
      открыта. Без него легко час спорить, почему правка «не работает»,
      когда на самом деле открыта старая заливка. */
-  var BUILD = '19.10 15:50';
+  var BUILD = '20.10 18:01';
 
   function ls(k, d) {
     try { var v = localStorage.getItem('pref-' + k); return v == null ? d : v; } catch (e) { return d; }
@@ -10838,6 +11077,67 @@ var Boot = (function () {
       '</table>';
   }
 
+  /* Вход и облако (src/p10_cloud.js): тот же вход, что в «Колдовстве».
+     Вошли — профиль один на все устройства, и под одним входом играть
+     можно только в одном месте. */
+  function cloudBox() {
+    var C = Cloud, h = '<h4 class="hd">Вход и облако</h4><div id="cloudBox">';
+    if (C.user) {
+      h += '<div class="sub" style="margin:0">Вы вошли: <b>' + esc(C.user.name || C.user.email || 'игрок') + '</b>' +
+        (C.user.email && C.user.name ? ' · ' + esc(C.user.email) : '') + '</div>' +
+        '<div class="hint">Профиль хранится в облаке и одинаков на всех устройствах, где вы вошли этим же ' +
+        'входом, — и в «Колдовстве» с «Клабором» вход тот же. Играть под одним входом можно только в одном месте: ' +
+        'откроете игру на другом устройстве — здесь она остановится.' +
+        (C.at ? ' Последнее сохранение в облако — ' + new Date(C.at).toTimeString().slice(0, 5) + '.' : '') + '</div>' +
+        '<div class="row"><button class="btn wide" data-m="cl-out">Выйти из профиля</button></div>';
+    } else {
+      h += '<div class="hint">Войдите — и профиль (портреты, секреты, статистика) станет одним на всех ' +
+        'ваших устройствах и не пропадёт при чистке браузера. Вход тот же, что в «Колдовстве» и «Клаборе».</div>' +
+        '<div class="row"><button class="btn pri wide" data-m="cl-google">Войти через Google</button></div>' +
+        '<input class="fld" id="clMail" type="email" autocomplete="email" placeholder="Почта">' +
+        '<input class="fld" id="clPass" type="password" autocomplete="current-password" placeholder="Пароль">' +
+        '<div class="row"><button class="btn wide" data-m="cl-in">Войти</button>' +
+        '<button class="btn wide" data-m="cl-up">Создать вход</button></div>' +
+        '<div class="row"><button class="btn wide" data-m="cl-reset">Забыли пароль?</button></div>';
+    }
+    return h + '<div class="hint" id="cloudMsg">' +
+      (C.state === 'wait' ? 'Связываемся с облаком…' : (C.err ? 'Облако: ' + esc(C.err) : '')) + '</div></div>';
+  }
+  function cloudWire(m) {
+    m.querySelectorAll('[data-m^="cl-"]').forEach(function (b) {
+      b.onclick = function () { cloudClick(b.dataset.m, m); };
+    });
+  }
+  function cloudClick(v, m) {
+    if (v.indexOf('cl-') !== 0) return false;
+    var say = function (t) { var e = m.querySelector('#cloudMsg'); if (e) e.textContent = t; };
+    var fail = function (e) { say('Облако: ' + (e.message || e)); };
+    var mail = ((m.querySelector('#clMail') || {}).value || '').trim();
+    var pass = (m.querySelector('#clPass') || {}).value || '';
+    if (v === 'cl-google') { say('Связываемся с облаком…'); Cloud.google().catch(fail); return true; }
+    if (v === 'cl-out') {
+      Cloud.signOut().then(function () { UI.toast('Вы вышли. Профиль остался и в этом браузере.'); }).catch(fail);
+      return true;
+    }
+    if (v === 'cl-reset') {
+      if (!mail) { say('Впишите почту — пришлём письмо для нового пароля.'); return true; }
+      Cloud.reset(mail).then(function () { say('Письмо для нового пароля отправлено на ' + mail + '.'); }).catch(fail);
+      return true;
+    }
+    if (!mail || !pass) { say('Впишите почту и пароль.'); return true; }
+    say('Связываемся с облаком…');
+    (v === 'cl-up' ? Cloud.signUp(mail, pass) : Cloud.signIn(mail, pass)).catch(fail);
+    return true;
+  }
+  // вошли, вышли, забрали игру — экран профиля перерисовываем, если он открыт
+  var cloudSeen = '';
+  Cloud.on(function (C) {
+    var k = (C.user ? C.user.uid : '') + '|' + C.owner + '|' + C.at;
+    if (k === cloudSeen) return; cloudSeen = k;
+    var a = document.activeElement;
+    if (document.getElementById('cloudBox') && !(a && /^cl(Mail|Pass)$/.test(a.id))) profile();
+  });
+
   function profile() {
     var open = facesOpen(), got = achList();
     var done = [], left = 0;
@@ -10876,6 +11176,7 @@ var Boot = (function () {
         '<div class="profhead">' + ART.ava(CFG.face, 'Я', 'big') +
         '<div><div class="pname">' + esc(myName()) + '</div>' +
         '<div class="sub" style="margin:0">' + profLine() + '</div></div></div>' +
+        cloudBox() +
 
         '<h4 class="hd">Как вас звать</h4>' +
         '<input class="fld" id="pName" maxlength="14" placeholder="Ваше имя" value="' +
@@ -10915,7 +11216,9 @@ var Boot = (function () {
         'номер — одно место. Вылетели и вернулись — сядете на своё, а не рядом с собой. ' +
         'Номер переносится вместе с профилем; меняйте его, только если хотите сесть за ' +
         'один стол с двух устройств сразу.</div>' +
-        '<div class="row"><button class="btn wide" id="pUid">Сменить номер</button></div>' +
+        (Cloud.user ? '<div class="hint">Пока вы вошли, номер общий для всех ваших устройств — ' +
+          'так один вход не сядет за стол дважды.</div>'
+          : '<div class="row"><button class="btn wide" id="pUid">Сменить номер</button></div>') +
 
         '<h4 class="hd">Профиль на вынос</h4>' +
         '<div class="hint">Одна строка уносит с собой всё: имя, портрет, открытые портреты, ' +
@@ -10942,7 +11245,9 @@ var Boot = (function () {
       if (q) q.onclick = function () {
         UI.toast('Ещё ' + left + ' портретов — за достижения. Условие открывается вместе с портретом.');
       };
-      m.querySelector('#pUid').onclick = function () {
+      cloudWire(m);
+      var pu = m.querySelector('#pUid');
+      if (pu) pu.onclick = function () {
         Net.newUid();
         UI.toast('Новый номер игрока. За столы, где вы уже сидели, вы теперь другой человек.');
         profile();
@@ -10962,12 +11267,12 @@ var Boot = (function () {
   function exportText() {
     var d = {
       v: 1, name: myName(), face: CFG.face, uid: Net.myUid(),
-      faces: facesOpen(), ach: achList(), stats: stats(), conv: CFG.conv
+      faces: facesOpen(), ach: achList(), stats: stats(), conv: CFG.conv, ch: CFG.myChar
     };
     try { return 'PREF1:' + btoa(unescape(encodeURIComponent(JSON.stringify(d)))); }
     catch (e) { return 'PREF1:' + JSON.stringify(d); }
   }
-  function importText(t) {
+  function importText(t, quiet) {
     t = String(t || '').trim();
     var i = t.indexOf('PREF1:');
     if (i < 0) return { ok: false, why: 'Это не строка профиля.' };
@@ -10980,8 +11285,11 @@ var Boot = (function () {
     /* Номер игрока — часть профиля: перенёс профиль — это по-прежнему
        ты, и за стол ты садишься одним человеком, а не двумя. */
     if (d.uid) Net.setUid(d.uid);
-    if (d.name && myName() === 'Игрок') setName(d.name);
-    if (d.face != null && CFG.face < 0) { CFG.face = d.face; }
+    /* quiet — это облако (src/p10_cloud.js): там профиль один на все
+       устройства, поэтому имя, портрет и характер берутся оттуда всегда. */
+    if (d.name && (quiet || myName() === 'Игрок')) setName(d.name);
+    if (d.face != null && (quiet || CFG.face < 0)) { CFG.face = d.face; }
+    if (quiet && d.ch) CFG.myChar = d.ch;
 
     var f = facesOpen(), k;
     (d.faces || []).forEach(function (x) { if (f.indexOf(x) < 0) f.push(x); });
@@ -10997,7 +11305,10 @@ var Boot = (function () {
 
     if (d.conv && K.CONV[d.conv]) CFG.conv = d.conv;
     saveCfg();
-    ach('loadFile');
+    if (quiet) {
+      try { if (Net.S.on && Net.updateMe) Net.updateMe(myName(), CFG.face); } catch (e) { }
+      try { if (window.Hall && Hall.updateMe) Hall.updateMe(myName(), CFG.face, hallCard()); } catch (e) { }
+    } else ach('loadFile');
     return { ok: true, faces: (d.faces || []).length, ach: (d.ach || []).length };
   }
 
