@@ -886,8 +886,12 @@ h4.hd:first-child{margin-top:0}
 #mtabs button.on{opacity:1;color:var(--gold)}
 
 @media (max-width:900px){
-  #side{position:absolute;inset:0;width:auto;flex:none;z-index:40;display:none}
-  #side.on{display:flex}
+  /* Панель ложится поверх стола, но только в пределах #body: без этого
+     она закрывала весь экран вместе с нижними вкладками, и вернуться
+     к «Столу» было нечем (найдено в клаборе, 20.10). Фон глухой. */
+  #body{position:relative}
+  #side{position:absolute;inset:0;width:auto;flex:none;z-index:40;display:none;background:rgb(12,32,36)}
+  #side.on,body.mpane #side{display:flex}   /* нижние вкладки «Пуля/Журнал/…» ставят body.mpane */
   #mtabs{display:flex}
   #top .chip.hideS{display:none}
   #top{gap:6px;padding:5px 8px}
@@ -10111,7 +10115,7 @@ var Boot = (function () {
      в клаборе: чтобы с одного взгляда было видно, КАКАЯ версия сейчас
      открыта. Без него легко час спорить, почему правка «не работает»,
      когда на самом деле открыта старая заливка. */
-  var BUILD = '20.10 18:01';
+  var BUILD = '20.10 18:25';
 
   function ls(k, d) {
     try { var v = localStorage.getItem('pref-' + k); return v == null ? d : v; } catch (e) { return d; }
