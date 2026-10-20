@@ -6579,9 +6579,17 @@ var Net = (function () {
   function swapSeats(i, j) {
     if (!S.host || S.ready) return false;
     if (i === j || i < 0 || j < 0 || i >= S.conns.length || j >= S.conns.length) return false;
-    var a = S.conns[i], b = S.conns[j];
-    var keep = ['name', 'key', 'conn', 'sent', 'bot', 'face', 'stats'];
-    keep.forEach(function (k) { var t = a[k]; a[k] = b[k]; b[k] = t; });
+    var a = S.conns[i], b = S.conns[j], k, t;
+    /* Пересадка переносит ЧЕЛОВЕКА целиком (та же починка, что в клаборе).
+       Раньше ехал только список полей, и номер игрока (uid) в нём забыли:
+       пересаженный вылетал, возвращался — и хозяин по номеру сажал его на
+       СТАРОЕ место, вышибая оттуда соседа («вы вошли из другого окна»).
+       Теперь меняем местами всё, кроме номера самого места. */
+    var keys = {};
+    for (k in a) keys[k] = 1;
+    for (k in b) keys[k] = 1;
+    delete keys.seat;
+    for (k in keys) { t = a[k]; a[k] = b[k]; b[k] = t; }
     a.seat = i; b.seat = j;
     // живым игрокам сообщаем их новое место, иначе они будут ждать чужих карт
     if (a.conn) send(a.conn, { t: 'seat', seat: i, key: a.key });
@@ -6678,6 +6686,11 @@ var Net = (function () {
     if (m.t === 'seat') {                            // хозяин пересадил — запоминаем новое место
       S.seat = m.seat;
       if (m.key) { S.key = m.key; LS('pref-key-' + S.code, m.key); }
+      // и запись «Вернуться за стол» — с новым местом и ключом
+      try {
+        var bk = JSON.parse(LS('pref-back') || 'null');
+        if (bk && bk.code === S.code) { bk.seat = m.seat; if (m.key) bk.key = m.key; LS('pref-back', JSON.stringify(bk)); }
+      } catch (e) { }
       if (S.game) S.game.seat = m.seat;
       if (UI && UI.toast) UI.toast('Хозяин пересадил вас на место ' + (m.seat + 1));
       if (window.Boot && Boot.lobbySeat) Boot.lobbySeat();
@@ -10115,7 +10128,7 @@ var Boot = (function () {
      в клаборе: чтобы с одного взгляда было видно, КАКАЯ версия сейчас
      открыта. Без него легко час спорить, почему правка «не работает»,
      когда на самом деле открыта старая заливка. */
-  var BUILD = '20.10 18:25';
+  var BUILD = '20.10 21:08';
 
   function ls(k, d) {
     try { var v = localStorage.getItem('pref-' + k); return v == null ? d : v; } catch (e) { return d; }
