@@ -6178,15 +6178,18 @@ var Net = (function () {
     try {
       localStorage.setItem('pref-host', JSON.stringify({
         ts: Date.now(), code: S.code, cfg: S.cfg,
-        conns: S.conns.map(function (c) { return { seat: c.seat, name: c.name, key: c.key, face: c.face }; }),
+        conns: S.conns.map(function (c) { return { seat: c.seat, name: c.name, key: c.key, face: c.face,
+          bot: !!c.bot && !c.away, uid: c.uid || null }; }),
         chars: g.chars || null, faces: g.faces || null,
-        game: Engine.snapshot(g)
+        game: g.save(), lvl: g.lvl || null, stats: g.stats || null
       }));
     } catch (e) { }
   }
   /* Запись живёт полсуток: код стола после этого всё равно мёртвый —
      хозяин давно закрыл вкладку, и кнопка вела бы в никуда. */
-  var BACK_TTL = 12 * 3600 * 1000;
+  /* [stated] Ник 22.10.2026: партию можно отложить и доиграть потом —
+     поэтому и «Вернуться за стол», и сохранённый стол живут месяц. */
+  var BACK_TTL = 30 * 24 * 3600 * 1000;
   function savedBack() {
     try {
       var d = JSON.parse(LS('pref-back') || 'null');
@@ -6200,8 +6203,8 @@ var Net = (function () {
   function savedHost() {
     try {
       var d = JSON.parse(localStorage.getItem('pref-host') || 'null');
-      if (!d || !d.code || !d.game) return null;
-      if (Date.now() - d.ts > 36 * 3600 * 1000) return null;   // старше полутора суток — не предлагаем
+      if (!d || !d.code || !d.game || d.game.over || d.game.v !== 2) return null;   // доигранную пулю не предлагаем
+      if (Date.now() - d.ts > BACK_TTL) return null;          // старше месяца — не предлагаем
       return d;
     } catch (e) { return null; }
   }
@@ -6238,7 +6241,9 @@ var Net = (function () {
           S.conns[i].key = fixed.conns[i].key || S.conns[i].key;
           S.conns[i].name = fixed.conns[i].name || S.conns[i].name;
           if (fixed.conns[i].face != null) S.conns[i].face = fixed.conns[i].face;
-          S.conns[i].bot = i !== 0;
+          /* старые записи без отметки — как раньше, боты; новые помнят людей */
+          S.conns[i].bot = i !== 0 && (fixed.conns[i].bot === undefined || !!fixed.conns[i].bot);
+          if (i !== 0 && fixed.conns[i].uid) S.conns[i].uid = fixed.conns[i].uid;
         }
       LS('pref-room', S.code);
       /* Поднять стол с первого раза выходит не всегда: публичный брокер
@@ -6830,6 +6835,56 @@ var Net = (function () {
   }
   function stopLoop() { loopStop = true; clearTimeout(backT); looping = null; }
 
+  /* ---------- отложить партию ----------
+     [stated] Ник 22.10.2026: «игра сохраняется — недоигранная партия
+     записывается хозяину стола; её можно закрыть и потом продолжить».
+     Запись уже лежит (saveHost на каждом ходе). Здесь хозяин закрывает
+     стол, НЕ стирая её, и прощается с гостями — иначе они бесконечно
+     стучались бы обратно. У гостей остаётся «Вернуться за стол»: когда
+     хозяин поднимет стол, они сядут на свои места по ключу и номеру. */
+  /* Закончить партию и закрыть стол: гостей отпускаем, запись стираем. */
+  function closeTable(why) {
+    if (!S.on) return;
+    if (S.host) {
+      for (var i = 1; i < S.conns.length; i++) {
+        var c = S.conns[i];
+        if (!c || !c.conn) continue;
+        try { send(c.conn, { t: 'bye', why: why || 'Партия окончена, стол закрыт.' }); } catch (e) { }
+      }
+      dropSaved();
+      setTimeout(leave, 400);
+      return;
+    }
+    leave();
+  }
+  function postpone() {
+    if (!S.on) return;
+    if (S.host) {
+      if (S.game) saveHost(S.game);
+      for (var i = 1; i < S.conns.length; i++) {
+        var c = S.conns[i];
+        if (c && c.conn) send(c.conn, { t: 'bye', later: true,
+          why: 'Хозяин отложил партию. Доиграете потом: «Вернуться за стол» в главном меню, когда он снова поднимет стол.' });
+      }
+      setTimeout(leave, 400);                 // прощание уходит по проводу — рвём связь не сразу
+      return;
+    }
+    leave();
+  }
+  /* Поднятый стол: места людей не отдаём ботам, а ждём их — как при
+     обрыве. Вернулся — сел на своё место; не вернулся — хозяин решает
+     сам (кнопка «Посадить бота» в плашке). */
+  function holdHumans() {
+    if (!S.host) return 0;
+    var k = 0;
+    for (var i = 1; i < S.conns.length; i++) {
+      var c = S.conns[i];
+      if (c && !c.bot && !c.conn) { c.away = Date.now(); k++; }
+    }
+    if (k) { lobbyPush(); awayPush(); }
+    return k;
+  }
+
   function leave() {
     stopLoop();
     try { if (S.peer) S.peer.destroy(); } catch (e) { }
@@ -6877,6 +6932,7 @@ var Net = (function () {
     S: S, createRoom: createRoom, joinRoom: joinRoom, broadcast: broadcast,
     startGame: startGame, leave: leave, reconnect: reconnect, loadPeer: loadPeer,
     T: T, reconnectLoop: reconnectLoop, seatBot: seatBot, awayList: awayList,
+    postpone: postpone, holdHumans: holdHumans, closeTable: closeTable,
     saveHost: saveHost, savedHost: savedHost, dropSaved: dropSaved, updateMe: updateMe,
     newPeer: newPeer, brokerText: brokerText, brokerCfg: brokerCfg,
     setBroker: setBroker, testBroker: testBroker,
@@ -10160,7 +10216,7 @@ var Boot = (function () {
      в клаборе: чтобы с одного взгляда было видно, КАКАЯ версия сейчас
      открыта. Без него легко час спорить, почему правка «не работает»,
      когда на самом деле открыта старая заливка. */
-  var BUILD = '22.10 12:30';
+  var BUILD = '22.10 13:33';
 
   function ls(k, d) {
     try { var v = localStorage.getItem('pref-' + k); return v == null ? d : v; } catch (e) { return d; }
@@ -10892,6 +10948,9 @@ var Boot = (function () {
        никуда не делось: код и ключ лежат в профиле, и меню делает из
        них одну кнопку. */
     var back = (window.Net && !Net.S.on && Net.savedBack) ? Net.savedBack() : null;
+    /* Отложенная сетевая пуля хозяина (Ник 22.10.2026: «закрыть и потом продолжить») */
+    var hostSv = (window.Net && !Net.S.on && Net.savedHost) ? Net.savedHost() : null;
+    if (hostSv) back = null;           // свой стол важнее чужого места
     /* Недоигранная партия с ботами — первой кнопкой. Она нужнее, чем
        «начать игру»: начать можно всегда, а вернуться — только сюда. */
     var sv = savedGame();
@@ -10912,7 +10971,9 @@ var Boot = (function () {
          кнопка читается медленнее, а две наши игры должны выглядеть роднёй. */
       (sv ? '<button class="btn big wide" id="mResume">Продолжить партию · сдача ' +
         (sv.g.handNo | 0) + '</button>' : '') +
-      '<button class="btn' + (sv ? '' : ' big') + ' wide" id="mStart">Начать игру</button>' +
+      (hostSv ? '<button class="btn big wide" id="mHostResume">Продолжить отложенную партию · стол ' +
+        esc(hostSv.code) + ' · сдача ' + (hostSv.game.handNo | 0) + '</button>' : '') +
+      '<button class="btn' + (sv || hostSv ? '' : ' big') + ' wide" id="mStart">Начать игру</button>' +
       '<button class="btn wide" id="mJoin">Подключиться к игре</button>' +
       (back ? '<button class="btn wide" id="mBack">Вернуться за стол ' + esc(back.code) + '</button>' : '') +
       '<button class="btn wide" id="mHall">Поднять свой стол</button>' +
@@ -10932,6 +10993,7 @@ var Boot = (function () {
       '\u2665 Поддержать</a></div>',
       function (m) {
         if (sv) m.querySelector('#mResume').onclick = resumeGame;
+        if (hostSv) m.querySelector('#mHostResume').onclick = function () { resumeHost(hostSv, this); };
         m.querySelector('#mStart').onclick = newGameDialog;
         m.querySelector('#mJoin').onclick = function () { scrJoin(''); };
         if (back) m.querySelector('#mBack').onclick = function () { resumeBack(back); };
@@ -11573,12 +11635,65 @@ var Boot = (function () {
       '<div class="sub">' + (host ? 'Вы подняли этот стол.' : 'Вы за чужим столом.') +
       ' Код можно передать тому, кого зовёте.</div>' +
       '<div class="row"><button class="btn" id="nClose">Назад за стол</button>' +
-      '<button class="btn" id="nLeave">Покинуть стол</button></div>',
+      (host
+        ? '<button class="btn" id="nLater">Отложить партию — доиграем потом</button></div>' +
+          '<div class="row"><button class="btn" id="nEnd">Закончить партию и закрыть стол</button></div>'
+        : '<button class="btn" id="nLeave">Покинуть стол</button></div>'),
       function (m) {
         m.querySelector('#nClose').onclick = UI.closeModal;
+        if (host) {
+          m.querySelector('#nLater').onclick = function () {
+            UI.closeModal(); Net.postpone(); netBtn();
+            UI.toast('Партия отложена. Продолжить — в главном меню');
+            mainMenu();
+          };
+          m.querySelector('#nEnd').onclick = function () {
+            UI.closeModal();
+            try { Net.closeTable('Хозяин закончил партию — стол закрыт.'); } catch (e) { }
+            netBtn(); mainMenu();
+          };
+          return;
+        }
         m.querySelector('#nLeave').onclick = function () {
           UI.closeModal(); Net.leave(); netBtn(); mainMenu();
         };
+      });
+  }
+
+  /* ---------- продолжить отложенную пулю ----------
+     Стол поднимается с тем же кодом и ключами мест. Пуля — из записи
+     хозяина. Боты садятся только туда, где сидели боты; места людей
+     ждут их (плашка «ждём игрока», хозяин может посадить бота сам). */
+  function resumeHost(d, btn) {
+    if (!d) return;
+    var g = Engine.Game.load(d.game);
+    if (!g) { Net.dropSaved(); mainMenu(); return; }
+    if (btn) btn.textContent = 'Поднимаю стол ' + d.code + '…';
+    Net.S.myFace = CFG.face;
+    Net.createRoom(d.cfg, (d.conns[0] && d.conns[0].name) || myName(), Net.lobbyPush,
+      { code: d.code, conns: d.conns }, CFG.face)
+      .then(function () {
+        G = g;
+        G.faces = d.faces || G.faces || null;
+        G.lvl = d.lvl || CFG.level;
+        G.stats = d.stats || [statCard()];
+        if (window.Talk) Talk.reset();
+        UI.closeModal(); UI.closeSplash();
+        toTable();
+        UI.attach(G, [], 0);
+        Net.startGame(G);
+        Net.holdHumans();                    // люди с прошлого раза — ждём их, ботов не сажаем
+        Net.broadcast(G);
+        UI.netEvents([]);
+        netBtn();
+        if (window.Hall && Hall.table) Hall.table(Net.S.code, d.cfg.N);
+        if (window.Hall && Hall.where) Hall.where('table');
+        UI.resume();
+        UI.toast('Стол ' + d.code + ' поднят. Игроки возвращаются по кнопке «Вернуться за стол»');
+      })
+      .catch(function (e) {
+        if (btn) btn.textContent = 'Продолжить отложенную партию · стол ' + d.code;
+        UI.toast('Не вышло поднять стол: ' + (e && e.message ? e.message : e));
       });
   }
 
