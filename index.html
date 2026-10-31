@@ -48,6 +48,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
      руке, и в веерах соперников, и на сдаче. Видно это только на
      собранном файле, в исходниках картинок нет вовсе. */
   --backimg:url('img/back.webp');
+  --rt-full:#d8b26a;--rt-empty:rgba(246,241,230,.22);   /* звёзды рейтинга в палитре стола */
   --infoh:48px;                    /* высота табло, ниже него всё остальное */
   --sf:1;                          /* масштаб интерфейса */
 }
@@ -246,6 +247,10 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 /* одесская биография портрета — под именем в карточке и в профиле */
 .bio{font-size:13px;line-height:1.45;color:#cfd8d8;font-style:italic;
   border-left:2px solid rgba(216,178,106,.5);padding:2px 0 2px 10px;margin:8px 0 10px}
+.rtbox{margin:6px 0 2px}
+.rtbig .rt-stars{font-size:30px;letter-spacing:2px}
+.rtres{margin:8px 0 2px;text-align:center}
+.rtmini .rt-stars{font-size:13px}
 .profhead{display:flex;gap:14px;align-items:center;margin:4px 0 10px}
 .profhead .pname{font:700 22px/1.2 "PT Serif",Georgia,serif;color:var(--gold)}
 table.prof{width:100%;border-collapse:collapse;font-size:14px;margin:6px 0 2px}
@@ -837,6 +842,9 @@ h4.hd:first-child{margin-top:0}
 .skin{height:52px;border-radius:8px;border:2px solid transparent;background-size:cover;
   background-position:center;position:relative;cursor:pointer}
 .skin.on{border-color:var(--gold)}
+.cardpick{grid-template-columns:repeat(auto-fill,minmax(64px,1fr))}
+.cardpick .skin{height:auto;aspect-ratio:344/512}
+.skin.locked{filter:grayscale(1) brightness(.45);cursor:not-allowed}
 .skin span{position:absolute;left:0;right:0;bottom:0;font-size:10px;background:rgba(0,0,0,.55);
   padding:2px;text-align:center;border-radius:0 0 6px 6px}
 .combolist{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0}
@@ -1667,6 +1675,718 @@ var K = (function () {
 })();
 if (typeof module !== 'undefined') module.exports = K;
 
+/* ============================================================================
+ * Рейтинг Malefictum — общий модуль для карточных игр платформы
+ * (клабор, преферанс, бридж, дурак и всё, что будет дальше).
+ *
+ * Внутри — Glicko-2 (рейтинг r, неуверенность rd, волатильность vol).
+ * Снаружи — звёзды от 1 до 5 с шагом в половину.
+ * Документация: платформа/09-РЕЙТИНГ.md. Тесты: платформа/rating/rating.test.js
+ *
+ * Модуль ничего не знает про конкретную игру, не трогает DOM (кроме
+ * необязательного injectCSS) и не трогает хранилище — только чистые функции
+ * над маленьким объектом состояния. Поэтому одинаково работает в браузере,
+ * в node-тестах, у хозяина стола и у гостя.
+ *
+ * Версия модуля: 2 (31.10.2026). Номер версии лежит в каждом состоянии (поле v).
+ *   v2: adopt принимает изменение (delta), если хозяин считал от устаревшего
+ *       состояния; holdExpired — срок, сколько заявка может ждать возврата за стол.
+ * ========================================================================== */
+(function (root) {
+  'use strict';
+
+  var VERSION = 2;
+  var SCALE = 173.7178;           // перевод шкалы Эло в шкалу Glicko-2 (400 / ln 10)
+  var BASE = 1500;                // ноль шкалы Glicko-2 — не путать со стартом игрока
+
+  /* ------------------------------------------------------------------------
+   * Настройки по умолчанию. Каждая игра накладывает поверх свой пресет
+   * (PRESETS ниже), а поверх пресета — свои замеры: Rating.config(id, {...}).
+   * --------------------------------------------------------------------- */
+  var DEFAULTS = {
+    start: 1500,        // рейтинг нового игрока
+    startRd: 350,       // неуверенность нового игрока
+    startVol: 0.06,     // волатильность нового игрока
+    tau: 0.5,           // как быстро может меняться волатильность (Glicko-2: 0.3–1.2)
+    rdMin: 45,          // ниже неуверенность не опускается — иначе рейтинг «застывает»
+    rdMax: 350,
+    periodDays: 7,      // каждая неделя простоя добавляет неуверенности, как один период
+
+    matchWeight: 1,     // вес одной партии (меньше 1 — для игр с большой удачей)
+    multiWeight: 'sqrt',// как делить вес партии на троих-четверых между соперниками:
+                        //   'sqrt' — 1/√(число соперников), 'even' — 1/n, 'full' — 1
+
+    // Режим мест (rank): кто выше — тот выиграл у каждого ниже.
+    winScore: 1,        // результат обычной победы в паре (1 — чистая, 0.85 — «победа, но не разгром»)
+    crushScore: 1,      // результат разгрома (погоны в дураке и т. п.)
+
+    // Режим счёта (score): победитель по итоговому счёту, с поправкой на разницу.
+    scoreMargin: 0,     // разница счёта, которая считается разгромом; 0 — учитывать только знак
+    scoreWinFloor: 0.75,// сколько даёт победа впритык (при scoreMargin > 0)
+
+    // Дубль (сравнение с ботами на тех же картах).
+    impScale: 6,        // сколько IMP за сдачу — «уверенно лучше бота» (результат ≈ 0.88)
+    dealWeight: 0.15,   // вес одной сдачи
+    dupRef: 3,          // с каким ботом сравниваем по умолчанию (уровень)
+
+    // Боты — якоря шкалы. Их рейтинг не меняется. Ключ — уровень бота в игре.
+    bots: { 1: 1350, 2: 1500, 3: 1650 },
+    botRd: 40,
+
+    // Звёзды.
+    stars: null,        // пороги [2★, 3★, 4★, 5★]; null — взять из ботов: [1, 2, 3, 3+topGap]
+    topGap: 120,        // 5★ — на столько выше сильнейшего бота
+    calibrationGames: 12,
+    confK: 1,           // осторожный рейтинг: rc = r − confK·max(0, rd − rdSettled)
+    rdSettled: 70,      // неуверенность устоявшегося игрока (Glicko-2 при партии за партией
+                        // держится около 60–70) — сверх неё и штрафуем осторожностью
+    hysteresis: 45,     // звезду теряем, только опустившись ниже порога на столько
+    caps: [[5, 100], [4.5, 60], [4, 30]], // [звёзды, минимум партий] — потолок по стажу
+    expLevels: [10, 30, 100, 300, 1000],  // стаж: 1…5 по числу партий (≈ ×3 на ступень)
+
+    keepIds: 30,        // сколько последних id партий помнить (защита от двойного зачёта)
+
+    // Брошенная партия. Бросил — проиграл всем за столом, как разгромно.
+    leaveWeight: 1,     // вес такого поражения (больше 1 — штрафовать сильнее обычного проигрыша)
+    pendTtlDays: 30,    // заявка старше — всё равно поражение, но без снимка соперников (против среднего бота)
+    holdDays: 7         // сетевая партия: столько заявка ждёт возврата за стол / подъёма стола, потом — поражение
+  };
+
+  /* ------------------------------------------------------------------------
+   * Пресеты игр. Числа ботов здесь — стартовые догадки. Их нужно заменить
+   * замером (Rating.calibrate) — см. 09-РЕЙТИНГ.md, «Калибровка».
+   * --------------------------------------------------------------------- */
+  var PRESETS = {
+    klabor: {
+      mode: 'score',
+      scoreMargin: 300,     // ПОДОБРАТЬ: разница итогового счёта, которую считать разгромом
+      scoreWinFloor: 0.75,
+      bots: { 1: 1380, 2: 1500, 3: 1620 }
+    },
+    preferans: {
+      mode: 'score',
+      scoreMargin: 150,     // ПОДОБРАТЬ: разница в вистах между двумя игроками — разгром
+      scoreWinFloor: 0.65,  // в преферансе размер выигрыша важнее, чем в клаборе
+      bots: { 1: 1380, 2: 1500, 3: 1620 }
+    },
+    bridge: {
+      mode: 'score',        // запасной путь: итог роббера; основной — дубль (applyDeals)
+      scoreMargin: 1000,
+      scoreWinFloor: 0.7,
+      matchWeight: 0.5,     // счёт роббера шумный — вес вдвое меньше
+      leaveWeight: 2,       // брошенный роббер весит как обычная партия, а не как половина
+      impScale: 6,
+      dealWeight: 0.15,
+      dupRef: 3,
+      bots: { 1: 1350, 2: 1500, 3: 1650 }
+    },
+    durak: {
+      mode: 'rank',
+      winScore: 0.85,       // обычная победа
+      crushScore: 1,        // погоны
+      bots: { 1: 1350, 2: 1500, 3: 1650 }
+    }
+  };
+
+  /* ------------------------------------------------------------------------ */
+
+  function extend(dst) {
+    for (var i = 1; i < arguments.length; i++) {
+      var src = arguments[i];
+      if (!src) continue;
+      for (var k in src) if (Object.prototype.hasOwnProperty.call(src, k)) {
+        var v = src[k];
+        if (v && typeof v === 'object' && !Array.isArray(v)) dst[k] = extend({}, dst[k] || {}, v);
+        else dst[k] = Array.isArray(v) ? v.slice() : v;
+      }
+    }
+    return dst;
+  }
+
+  /** Собрать настройки игры: DEFAULTS + пресет + свои поправки. */
+  function config(gameId, overrides) {
+    var c = extend({}, DEFAULTS, PRESETS[gameId] || {}, overrides || {});
+    c.game = gameId;
+    // боты не сливаются, а заменяются целиком: у игры может быть другой набор уровней
+    var src = (overrides && overrides.bots) || (PRESETS[gameId] && PRESETS[gameId].bots) || DEFAULTS.bots;
+    var b = {};
+    for (var k in src) b[String(k)] = +src[k];
+    c.bots = b;
+    return c;
+  }
+
+  function r2(x) { return Math.round(x * 100) / 100; }
+  function now(t) { return typeof t === 'number' ? t : Date.now(); }
+
+  /** Новое состояние игрока. Это всё, что нужно хранить (≈150 байт). */
+  function fresh(cfg, t) {
+    return {
+      v: VERSION,
+      r: cfg.start, rd: cfg.startRd, vol: cfg.startVol,
+      n: 0,        // партий всего
+      h: 0,        // из них с живыми людьми за столом
+      t: now(t),   // время последней партии
+      s: 0,        // показанные звёзды (0 — калибровка)
+      pk: 0,       // лучшие звёзды за всё время
+      ab: 0,       // брошенных партий (засчитаны поражением)
+      ids: []      // последние id партий
+    };
+  }
+
+  /** Привести к виду текущей версии; мусор — в новое состояние. */
+  function normalize(cfg, st) {
+    if (!st || typeof st !== 'object' || !isFinite(st.r) || !isFinite(st.rd)) return fresh(cfg);
+    var o = fresh(cfg, st.t);
+    o.r = +st.r; o.rd = Math.min(cfg.rdMax, Math.max(cfg.rdMin, +st.rd));
+    o.vol = isFinite(st.vol) && st.vol > 0 ? +st.vol : cfg.startVol;
+    o.n = st.n | 0; o.h = st.h | 0; o.s = +st.s || 0; o.pk = +st.pk || 0; o.ab = st.ab | 0;
+    o.ids = Array.isArray(st.ids) ? st.ids.slice(-cfg.keepIds) : [];
+    return o;
+  }
+
+  function botState(cfg, level) {
+    var r = cfg.bots[String(level)];
+    if (!isFinite(r)) throw new Error('Rating: нет рейтинга для бота уровня ' + level);
+    return { r: r, rd: cfg.botRd, vol: cfg.startVol, bot: true };
+  }
+
+  /* ---------------------------- Glicko-2 ------------------------------- */
+
+  function g(phi) { return 1 / Math.sqrt(1 + 3 * phi * phi / (Math.PI * Math.PI)); }
+  function Ex(mu, muj, phij) { return 1 / (1 + Math.exp(-g(phij) * (mu - muj))); }
+
+  /** Неуверенность растёт за простой. */
+  function decay(cfg, st, t) {
+    var days = (now(t) - (st.t || now(t))) / 86400000;
+    if (days < cfg.periodDays) return st.rd;
+    var periods = Math.floor(days / cfg.periodDays);
+    var phi = st.rd / SCALE;
+    phi = Math.sqrt(phi * phi + periods * st.vol * st.vol);
+    return Math.min(cfg.rdMax, phi * SCALE);
+  }
+
+  function newVol(phi, vol, v, delta, tau) {
+    var a = Math.log(vol * vol), eps = 1e-6;
+    var d2 = delta * delta, p2 = phi * phi;
+    function f(x) {
+      var ex = Math.exp(x);
+      return ex * (d2 - p2 - v - ex) / (2 * Math.pow(p2 + v + ex, 2)) - (x - a) / (tau * tau);
+    }
+    var A = a, B, k;
+    if (d2 > p2 + v) B = Math.log(d2 - p2 - v);
+    else { k = 1; while (f(a - k * tau) < 0 && k < 60) k++; B = a - k * tau; }
+    var fA = f(A), fB = f(B), it = 0;
+    while (Math.abs(B - A) > eps && it++ < 100) {
+      var C = A + (A - B) * fA / (fB - fA), fC = f(C);
+      if (fC * fB <= 0) { A = B; fA = fB; } else fA = fA / 2;
+      B = C; fB = fC;
+    }
+    return Math.exp(A / 2);
+  }
+
+  /**
+   * Одно обновление Glicko-2.
+   * obs: [{mu, phi, s, w}] — соперники (в шкале Glicko-2), результат 0..1, вес.
+   * muSelf — от чьего рейтинга считать ожидание (для пары — средний по паре).
+   */
+  function glicko(cfg, st, rdNow, muSelf, obs) {
+    var mu = (st.r - BASE) / SCALE, phi = rdNow / SCALE;
+    var vInv = 0, dsum = 0;
+    for (var i = 0; i < obs.length; i++) {
+      var o = obs[i], gj = g(o.phi), e = Ex(muSelf, o.mu, o.phi);
+      vInv += o.w * gj * gj * e * (1 - e);
+      dsum += o.w * gj * (o.s - e);
+    }
+    if (vInv <= 0) return { r: st.r, rd: rdNow, vol: st.vol };
+    var v = 1 / vInv, delta = v * dsum;
+    var vol = newVol(phi, st.vol, v, delta, cfg.tau);
+    var phiStar = Math.sqrt(phi * phi + vol * vol);
+    var phiNew = 1 / Math.sqrt(1 / (phiStar * phiStar) + 1 / v);
+    var muNew = mu + phiNew * phiNew * dsum;
+    var rd = Math.min(cfg.rdMax, Math.max(cfg.rdMin, phiNew * SCALE));
+    return { r: muNew * SCALE + BASE, rd: rd, vol: vol };
+  }
+
+  /** Ожидаемый результат a против b (0..1) — для подсказок и тестов. */
+  function expected(a, b) {
+    var phi = Math.sqrt((a.rd * a.rd + b.rd * b.rd)) / SCALE;
+    return Ex((a.r - BASE) / SCALE, (b.r - BASE) / SCALE, phi);
+  }
+
+  /* --------------------------- Звёзды ---------------------------------- */
+
+  /** Пороги в рейтинге: [1★, 2★, 3★, 4★, 5★] (уже с поправкой на осторожность). */
+  function thresholds(cfg) {
+    var t;
+    if (cfg.stars && cfg.stars.length === 4) t = cfg.stars.slice();
+    else {
+      var lv = Object.keys(cfg.bots).map(Number).sort(function (a, b) { return a - b; });
+      var lo = cfg.bots[lv[0]], mid = cfg.bots[lv[Math.floor((lv.length - 1) / 2)]], hi = cfg.bots[lv[lv.length - 1]];
+      if (lv.length === 2) mid = (lo + hi) / 2;
+      t = [lo, mid, hi, hi + cfg.topGap];
+    }
+    var t1 = t[0] - (t[1] - t[0]);              // 1★ — на шаг ниже слабого бота
+    return [t1, t[0], t[1], t[2], t[3]];
+  }
+
+  /** Непрерывные звёзды 1..5 по осторожному рейтингу. */
+  function starsAt(cfg, rc) {
+    var T = thresholds(cfg);
+    if (rc <= T[0]) return 1;
+    if (rc >= T[4]) return 5;
+    for (var i = 0; i < 4; i++) if (rc < T[i + 1]) return 1 + i + (rc - T[i]) / (T[i + 1] - T[i]);
+    return 5;
+  }
+
+  /** Обратное: какой осторожный рейтинг нужен для value звёзд. */
+  function rcFor(cfg, value) {
+    var T = thresholds(cfg);
+    var v = Math.max(1, Math.min(5, value)), i = Math.min(3, Math.floor(v - 1));
+    return T[i] + (v - 1 - i) * (T[i + 1] - T[i]);
+  }
+
+  function capFor(cfg, n) {
+    var cap = 5;
+    for (var i = 0; i < cfg.caps.length; i++) if (n < cfg.caps[i][1]) cap = Math.min(cap, cfg.caps[i][0] - 0.5);
+    return cap;
+  }
+
+  /** Пересчитать показанные звёзды с гистерезисом. Мутирует st. */
+  function rcOf(cfg, st) { return st.r - cfg.confK * Math.max(0, st.rd - cfg.rdSettled); }
+
+  function refreshStars(cfg, st) {
+    if (st.n < cfg.calibrationGames) { st.s = 0; return st; }
+    var rc = rcOf(cfg, st);
+    var raw = Math.floor(starsAt(cfg, rc) * 2) / 2;
+    raw = Math.min(raw, capFor(cfg, st.n));
+    if (!st.s || raw >= st.s) st.s = raw;
+    else if (rc < rcFor(cfg, st.s) - cfg.hysteresis) st.s = raw;
+    if (st.s > st.pk) st.pk = st.s;
+    return st;
+  }
+
+  function expLevel(cfg, n) {
+    var L = 0;
+    for (var i = 0; i < cfg.expLevels.length; i++) if (n >= cfg.expLevels[i]) L = i + 1;
+    return { level: L, next: cfg.expLevels[L] || null };
+  }
+
+  /** Всё, что нужно для показа в профиле и за столом. */
+  function view(cfg, st) {
+    st = normalize(cfg, st);
+    var cal = st.n < cfg.calibrationGames;
+    var e = expLevel(cfg, st.n);
+    return {
+      stars: cal ? 0 : st.s,
+      calibrating: cal,
+      left: cal ? cfg.calibrationGames - st.n : 0,
+      peak: st.pk,
+      games: st.n, human: st.h, abandoned: st.ab,
+      r: Math.round(st.r), rd: Math.round(st.rd),
+      rc: Math.round(rcOf(cfg, st)),
+      exp: e.level, expNext: e.next
+    };
+  }
+
+  /* ------------------------- Зачёт партии ------------------------------ */
+
+  function pushId(cfg, st, id) {
+    if (id == null) return;
+    st.ids.push(String(id));
+    if (st.ids.length > cfg.keepIds) st.ids = st.ids.slice(-cfg.keepIds);
+  }
+
+  function multiW(cfg, nOpp) {
+    if (nOpp <= 1 || cfg.multiWeight === 'full') return 1;
+    if (cfg.multiWeight === 'even') return 1 / nOpp;
+    return 1 / Math.sqrt(nOpp);
+  }
+
+  function pairScore(cfg, mode, A, B, crushSet) {
+    // бросивший проигрывает всем, кто остался, — полностью, как разгромом
+    if (A.left || B.left) return A.left && B.left ? 0.5 : (A.left ? 0 : 1);
+    if (mode === 'rank') {
+      if (A.place === B.place) return 0.5;
+      var win = A.place < B.place, w = win ? A : B, l = win ? B : A;
+      var sc = crushSet[w.id + '>' + l.id] ? cfg.crushScore : cfg.winScore;
+      return win ? sc : 1 - sc;
+    }
+    var d = A.score - B.score;
+    if (d === 0) return 0.5;
+    var base = cfg.scoreMargin > 0
+      ? cfg.scoreWinFloor + (1 - cfg.scoreWinFloor) * Math.min(1, Math.abs(d) / cfg.scoreMargin)
+      : 1;
+    return d > 0 ? base : 1 - base;
+  }
+
+  /**
+   * Зачесть партию.
+   *
+   * match = {
+   *   id:    'уникальный id партии' (обязательно для сети: защита от двойного зачёта),
+   *   mode:  'rank' | 'score'   (по умолчанию cfg.mode),
+   *   now:   Date.now(),
+   *   weight: 1                 (необязательно: доп. множитель веса партии),
+   *   seats: [{
+   *     key:   'p0',            — как вы зовёте место (вернётся в ответе)
+   *     state: {...} | null,    — состояние живого игрока (null — новичок)
+   *     bot:   2,               — уровень бота (тогда state не нужен)
+   *     team:  0,               — номер пары; без него каждый сам за себя
+   *     place: 1,               — режим rank: 1 — лучший; равные места — ничья
+   *     score: 312              — режим score: итог партии (больше — лучше)
+   *   }],
+   *   crush: [['p1','p3'], …]   — режим rank: пары «победитель, проигравший», где был разгром
+   *                               (можно указывать и по командам: ключ любого члена пары)
+   * }
+   *
+   * Ответ: { states: {key: новоеСостояние}, deltas: {key: изменение r}, skipped: [key] }
+   * Боты в ответ не попадают.
+   */
+  function applyMatch(cfg, match) {
+    var mode = match.mode || cfg.mode || 'rank';
+    var t = now(match.now);
+    var seats = match.seats || [];
+    var units = [], byTeam = {};
+
+    // 1. собрать места в «единицы» (игрок-одиночка или пара)
+    seats.forEach(function (s, i) {
+      var p = s.bot != null ? botState(cfg, s.bot) : normalize(cfg, s.state);
+      var rdNow = p.bot ? p.rd : decay(cfg, p, t);
+      var m = { key: s.key != null ? String(s.key) : String(i), seat: s, st: p, rdNow: rdNow, bot: !!p.bot, left: !!s.left };
+      var tk = s.team != null ? 'T' + s.team : 'S' + i;
+      var u = byTeam[tk];
+      if (!u) {
+        u = byTeam[tk] = { id: tk, members: [], place: s.place, score: s.score };
+        units.push(u);
+      }
+      if (u.place == null) u.place = s.place;
+      if (u.score == null) u.score = s.score;
+      u.members.push(m);
+      if (m.left) u.left = true;
+    });
+    if (units.length < 2) return { states: {}, deltas: {}, skipped: [] };
+
+    units.forEach(function (u) {
+      var mus = 0, phis = 0;
+      u.members.forEach(function (m) {
+        mus += (m.st.r - BASE) / SCALE;
+        phis += Math.pow(m.rdNow / SCALE, 2);
+      });
+      u.mu = mus / u.members.length;
+      u.phi = Math.sqrt(phis / u.members.length);
+    });
+
+    // 2. разгромы: ключи мест → id единиц
+    var keyUnit = {};
+    units.forEach(function (u) { u.members.forEach(function (m) { keyUnit[m.key] = u.id; }); });
+    var crushSet = {};
+    (match.crush || []).forEach(function (pr) {
+      var a = keyUnit[String(pr[0])], b = keyUnit[String(pr[1])];
+      if (a && b) crushSet[a + '>' + b] = true;
+    });
+
+    var humans = 0;
+    seats.forEach(function (s) { if (s.bot == null) humans++; });
+
+    // 3. каждому живому — своё обновление против всех чужих единиц
+    var out = { states: {}, deltas: {}, skipped: [], void: [] };
+    var only = match.only != null ? [].concat(match.only).map(String) : null;
+    var w0 = (cfg.matchWeight || 1) * (match.weight || 1);
+    units.forEach(function (u) {
+      var opp = units.filter(function (x) { return x !== u; });
+      var w = w0 * multiW(cfg, opp.length);
+      u.members.forEach(function (m) {
+        if (m.bot) return;
+        if (only && only.indexOf(m.key) < 0) return;
+        var st = m.st;
+        // остался за столом, а партнёр бросил: партия для него не считается
+        if (u.left && !m.left) { out.void.push(m.key); return; }
+        // бросивший: проигрыш каждой чужой единице, кто бы где ни оказался
+        var obs = opp.map(function (o) {
+          var sc = m.left ? (o.left ? 0.5 : 0) : pairScore(cfg, mode, u, o, crushSet);
+          return { mu: o.mu, phi: o.phi, s: sc, w: m.left ? w * cfg.leaveWeight : w };
+        });
+        if (match.id != null && st.ids.indexOf(String(match.id)) >= 0) {
+          out.states[m.key] = st; out.deltas[m.key] = 0; out.skipped.push(m.key);
+          return;
+        }
+        var res = glicko(cfg, st, m.rdNow, u.mu, obs);
+        var ns = extend({}, st, { r: r2(res.r), rd: r2(res.rd), vol: Math.round(res.vol * 1e6) / 1e6, t: t });
+        ns.ids = st.ids.slice();
+        ns.n = st.n + 1;
+        ns.h = st.h + (humans > 1 ? 1 : 0);
+        if (m.left) ns.ab = (st.ab | 0) + 1;
+        pushId(cfg, ns, match.id);
+        refreshStars(cfg, ns);
+        out.states[m.key] = ns;
+        out.deltas[m.key] = r2(ns.r - st.r);
+      });
+    });
+    return out;
+  }
+
+  /**
+   * Дубль: зачесть сессию сдач, сравнивая игрока с ботом на тех же картах.
+   * Вызывать ОДИН раз на роббер / партию / пульку, передав все сдачи сразу.
+   *
+   * deals: [число IMP «я минус бот на моём месте»] или [{imps}]
+   * opts:  { id, now, ref: уровень бота-эталона (по умолчанию cfg.dupRef),
+   *          human: true, если за столом были живые люди }
+   * Ответ: { state, delta, skipped }
+   */
+  function applyDeals(cfg, state, deals, opts) {
+    opts = opts || {};
+    var st = normalize(cfg, state), t = now(opts.now);
+    if (opts.id != null && st.ids.indexOf(String(opts.id)) >= 0) return { state: st, delta: 0, skipped: true };
+    var ref = botState(cfg, opts.ref != null ? opts.ref : cfg.dupRef);
+    var rdNow = decay(cfg, st, t);
+    var refMu = (ref.r - BASE) / SCALE, refPhi = ref.rd / SCALE;
+    var obs = (deals || []).map(function (d) {
+      var imps = typeof d === 'number' ? d : +d.imps || 0;
+      return { mu: refMu, phi: refPhi, s: 0.5 + 0.5 * Math.tanh(imps / cfg.impScale), w: cfg.dealWeight };
+    });
+    if (!obs.length) return { state: st, delta: 0, skipped: true };
+    var res = glicko(cfg, st, rdNow, (st.r - BASE) / SCALE, obs);
+    var ns = extend({}, st, { r: r2(res.r), rd: r2(res.rd), vol: Math.round(res.vol * 1e6) / 1e6, t: t });
+    ns.ids = st.ids.slice();
+    ns.n = st.n + 1;
+    ns.h = st.h + (opts.human ? 1 : 0);
+    pushId(cfg, ns, opts.id);
+    refreshStars(cfg, ns);
+    return { state: ns, delta: r2(ns.r - st.r), skipped: false };
+  }
+
+  /**
+   * Гость получил от хозяина своё новое состояние. Принять, если эта партия
+   * у него ещё не зачтена и пришедшее состояние выросло из его же текущего.
+   */
+  function adopt(cfg, local, remote, matchId, delta) {
+    var a = normalize(cfg, local);
+    if (!remote) return a;
+    var b = normalize(cfg, remote), id = matchId != null ? String(matchId) : null;
+    if (id && a.ids.indexOf(id) >= 0) return a;                 // уже зачтено
+    // посчитано ровно от моего текущего состояния — берём как есть
+    if (b.n === a.n + 1 && (!id || b.ids.indexOf(id) >= 0)) return b;
+    // хозяин считал от устаревшего снимка (например, после прошлой партии
+    // за этим же столом ему не прислали новое) — переносим только изменение,
+    // иначе прошлая партия потерялась бы
+    if (isFinite(delta)) {
+      var o = extend({}, a);
+      o.ids = a.ids.slice();
+      o.r = r2(a.r + (+delta));
+      o.rd = r2(Math.max(cfg.rdMin, Math.min(a.rd, b.rd)));
+      o.vol = b.vol;
+      o.n = a.n + 1;
+      o.h = a.h + 1;                     // результат от хозяина — партия была с людьми
+      o.t = Math.max(a.t, b.t);
+      pushId(cfg, o, id);
+      refreshStars(cfg, o);
+      return o;
+    }
+    return b.n > a.n ? b : a;            // без изменения не откатываемся
+  }
+
+  /** Сетевая заявка ждёт возврата за стол слишком долго — пора засчитать поражение. */
+  function holdExpired(cfg, pend, t) {
+    if (!pend || !pend.t) return true;
+    return (now(t) - pend.t) / 86400000 > cfg.holdDays;
+  }
+
+  /** Сложить два профиля (импорт файлом / облако): берём «длиннее», id объединяем. */
+  function merge(cfg, a, b) {
+    a = normalize(cfg, a); b = normalize(cfg, b);
+    var main = (b.n > a.n || (b.n === a.n && b.t > a.t)) ? b : a;
+    var other = main === a ? b : a;
+    var ids = main.ids.slice();
+    other.ids.forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
+    var o = extend({}, main);
+    o.ids = ids.slice(-cfg.keepIds);
+    o.pk = Math.max(a.pk, b.pk);
+    return o;
+  }
+
+  /* ----------------------- Брошенная партия ---------------------------- */
+
+  /**
+   * Заявка на партию — «залог поражения». Пишется в хранилище, как только
+   * партия началась (розданы карты), и снимается только на итогах.
+   * Если вкладку закрыли, браузер упал, игрок ушёл в меню или начал новую
+   * партию поверх этой — заявка остаётся, и при следующем запуске
+   * forfeit() засчитывает её поражением.
+   *
+   * match — то же, что для applyMatch (id, mode, seats), только без мест и
+   * счёта; me — ключ своего места. Состояния соперников сохраняются снимком
+   * (только r и rd), чтобы поражение считалось против тех, кто сидел за столом.
+   */
+  function pending(cfg, match, me) {
+    var seats = (match.seats || []).map(function (s, i) {
+      var key = s.key != null ? String(s.key) : String(i);
+      var o = { key: key };
+      if (s.team != null) o.team = s.team;
+      if (s.bot != null) o.bot = s.bot;
+      else if (key !== String(me)) {
+        var st = normalize(cfg, s.state);
+        o.r = r2(st.r); o.rd = r2(st.rd);
+      }
+      return o;
+    });
+    return { v: VERSION, id: String(match.id), me: String(me), t: now(match.now), mode: match.mode || cfg.mode, seats: seats };
+  }
+
+  /**
+   * Засчитать брошенную партию поражением. Возвращает {state, delta, skipped}.
+   * skipped — партия уже зачтена (итоги успели записаться до падения).
+   */
+  function forfeit(cfg, state, pend, t) {
+    var st = normalize(cfg, state);
+    if (!pend || pend.id == null) return { state: st, delta: 0, skipped: true };
+    if (st.ids.indexOf(String(pend.id)) >= 0) return { state: st, delta: 0, skipped: true };
+    var tt = now(t);
+    var old = (tt - (pend.t || tt)) / 86400000 > cfg.pendTtlDays;
+    var seats = (pend.seats || []).map(function (s) {
+      var o = { key: s.key, team: s.team };
+      if (s.key === pend.me) { o.state = st; o.left = true; }
+      else if (s.bot != null || old) o.bot = s.bot != null ? s.bot : midBot(cfg);
+      else o.state = { r: s.r, rd: s.rd };
+      return o;
+    });
+    if (!seats.some(function (s) { return s.key === pend.me; })) return { state: st, delta: 0, skipped: true };
+    var res = applyMatch(cfg, { id: pend.id, mode: pend.mode, now: tt, seats: seats, only: pend.me });
+    var ns = res.states[pend.me] || st;
+    return { state: ns, delta: res.deltas[pend.me] || 0, skipped: !res.states[pend.me] };
+  }
+
+  function midBot(cfg) {
+    var lv = Object.keys(cfg.bots).map(Number).sort(function (a, b) { return a - b; });
+    return lv[Math.floor((lv.length - 1) / 2)];
+  }
+
+  /* ------------------------- Калибровка ботов -------------------------- */
+
+  /**
+   * Рейтинги ботов по матчам бот-против-бота (модель Брэдли — Терри).
+   * results: [{a: 1, b: 3, wa: 412, wb: 588, d: 0}] — победы a, победы b, ничьи
+   * anchor:  {level: 2, r: 1500} — кого держим на месте
+   * Ответ: { 1: 1371, 2: 1500, 3: 1618 }
+   */
+  function calibrate(results, anchor) {
+    var names = {}, W = {}, N = {};
+    results.forEach(function (x) {
+      var a = String(x.a), b = String(x.b), d = x.d || 0;
+      names[a] = names[b] = 1;
+      W[a] = (W[a] || 0) + x.wa + d / 2;
+      W[b] = (W[b] || 0) + x.wb + d / 2;
+      var n = x.wa + x.wb + d;
+      N[a + '|' + b] = (N[a + '|' + b] || 0) + n;
+      N[b + '|' + a] = (N[b + '|' + a] || 0) + n;
+    });
+    var ks = Object.keys(names), gm = {};
+    ks.forEach(function (k) { gm[k] = 1; W[k] = Math.max(W[k] || 0, 0.5); });
+    for (var it = 0; it < 500; it++) {
+      var nx = {};
+      ks.forEach(function (i) {
+        var den = 0;
+        ks.forEach(function (j) { if (i !== j && N[i + '|' + j]) den += N[i + '|' + j] / (gm[i] + gm[j]); });
+        nx[i] = den > 0 ? W[i] / den : gm[i];
+      });
+      gm = nx;
+    }
+    var al = String(anchor ? anchor.level : ks[0]), ar = anchor ? anchor.r : 1500;
+    var out = {};
+    ks.forEach(function (k) { out[k] = Math.round(ar + 400 * Math.log10(gm[k] / gm[al])); });
+    return out;
+  }
+
+  /**
+   * Подобрать impScale для дубля. Прогнать дублем бота a против бота-эталона b
+   * (тот же расклад, a на месте, b — эталон на том же месте) и собрать IMP за сдачу.
+   * gap — разница их рейтингов (из calibrate). Возвращает impScale, при котором
+   * средний результат сдачи совпадает с ожиданием по Эло.
+   */
+  function calibrateImps(imps, gap) {
+    if (!imps.length) return DEFAULTS.impScale;
+    var target = 1 / (1 + Math.pow(10, -gap / 400));
+    function mean(sc) {
+      var s = 0;
+      for (var i = 0; i < imps.length; i++) s += 0.5 + 0.5 * Math.tanh(imps[i] / sc);
+      return s / imps.length;
+    }
+    var lo = 0.2, hi = 200;
+    // если даже при самом резком переводе IMP в результат цель недостижима —
+    // разница ботов в IMP слишком мала для такого gap: проверьте замер
+    if (Math.abs(mean(lo) - 0.5) < Math.abs(target - 0.5)) return NaN;
+    // mean монотонна по scale: растёт scale — результат ближе к 0.5
+    for (var it = 0; it < 80; it++) {
+      var mid = Math.sqrt(lo * hi), m = mean(mid);
+      if ((m - 0.5) * (target - 0.5) < 0) return NaN; // знак не тот: бот a слабее, а IMP в его пользу
+      if (Math.abs(m - 0.5) > Math.abs(target - 0.5)) lo = mid; else hi = mid;
+    }
+    return Math.round(Math.sqrt(lo * hi) * 100) / 100;
+  }
+
+  /* --------------------------- Показ ----------------------------------- */
+
+  var CSS =
+    '.rt-stars{display:inline-flex;gap:1px;line-height:1;white-space:nowrap;vertical-align:middle}' +
+    '.rt-s{position:relative;display:inline-block;color:var(--rt-empty,rgba(128,128,128,.45))}' +
+    '.rt-s.rt-full{color:var(--rt-full,#e6b422)}' +
+    '.rt-s.rt-half::before{content:"\\2605";position:absolute;left:0;top:0;width:50%;overflow:hidden;color:var(--rt-full,#e6b422)}' +
+    '.rt-cal{font-size:.85em;opacity:.75;white-space:nowrap}';
+
+  function injectCSS(doc) {
+    try {
+      doc = doc || (typeof document !== 'undefined' ? document : null);
+      if (!doc || doc.getElementById('rt-css')) return;
+      var el = doc.createElement('style');
+      el.id = 'rt-css'; el.textContent = CSS;
+      (doc.head || doc.documentElement).appendChild(el);
+    } catch (e) { /* предпросмотр без DOM — не страшно */ }
+  }
+
+  /** HTML звёзд. Для калибровки — текст «калибровка N/12». */
+  function starsHTML(cfg, stOrView) {
+    var vw = stOrView && 'calibrating' in stOrView ? stOrView : view(cfg, stOrView);
+    if (vw.calibrating) {
+      return '<span class="rt-cal" title="Рейтинг появится после ' + cfg.calibrationGames +
+        ' партий">калибровка ' + vw.games + '/' + cfg.calibrationGames + '</span>';
+    }
+    var h = '<span class="rt-stars" title="' + vw.stars + ' из 5">';
+    for (var i = 1; i <= 5; i++) {
+      var cls = vw.stars >= i ? 'rt-full' : (vw.stars >= i - 0.5 ? 'rt-half' : 'rt-empty');
+      h += '<span class="rt-s ' + cls + '">★</span>';
+    }
+    return h + '</span>';
+  }
+
+  /** Текстом — для логов, чата и подсказок: «★★★½☆». */
+  function starsText(value) {
+    if (!value) return 'калибровка';
+    var s = '';
+    for (var i = 1; i <= 5; i++) s += value >= i ? '★' : (value >= i - 0.5 ? '½' : '☆');
+    return s;
+  }
+
+  /** Короткая карточка для чужих глаз (едет по сети вместе со statCard). */
+  function card(cfg, st) {
+    var v = view(cfg, st);
+    return { r: v.r, rd: v.rd, n: v.games, s: v.stars, c: v.calibrating ? 1 : 0 };
+  }
+
+  var Rating = {
+    VERSION: VERSION, DEFAULTS: DEFAULTS, PRESETS: PRESETS, CSS: CSS,
+    config: config, fresh: fresh, normalize: normalize,
+    applyMatch: applyMatch, applyDeals: applyDeals, adopt: adopt, merge: merge,
+    pending: pending, forfeit: forfeit, holdExpired: holdExpired,
+    expected: expected, calibrate: calibrate, calibrateImps: calibrateImps,
+    view: view, thresholds: thresholds, starsAt: starsAt, rcFor: rcFor,
+    starsHTML: starsHTML, starsText: starsText, injectCSS: injectCSS, card: card,
+    _decay: decay
+  };
+
+  if (typeof module !== 'undefined' && module.exports) module.exports = Rating;
+  else root.Rating = Rating;
+})(typeof window !== 'undefined' ? window : this);
+
 /* ============================================================
    КЛАБОР — графика
    Фигурные карты — нарезка со скана советских «Атласных».
@@ -1731,7 +2451,8 @@ var ART = (function () {
       L.mid.forEach(function (y) { body += pip(s, XC, y, PS, col); });
     }
     return '<svg viewBox="0 0 344 512" xmlns="http://www.w3.org/2000/svg">' +
-      '<rect width="344" height="512" rx="14" fill="' + PAPER + '"/>' +
+      '<rect width="344" height="512" rx="14" fill="' +
+        ((typeof CARDS !== 'undefined' && CARDS.paper()) || PAPER) + '"/>' +
       corner(ru, s, col, false) + corner(ru, s, col, true) + body + '</svg>';
   }
 
@@ -1747,12 +2468,15 @@ var ART = (function () {
     var i = K.id(c);
     if (cache[i]) return cache[i];
     var h;
-    if (c.r === 'K' || c.r === 'Q' || c.r === 'J')
+    if (IMG[i])            // фигуры всегда, тузы — если колода их даёт (CARDS)
       h = '<img alt="' + K.name(c) + '" src="' + IMG[i] + '" draggable="false">';
     else h = faceSVG(c.r, c.s);
     cache[i] = h;
     return h;
   }
+
+  // Смена колоды или рубашки (CARDS.apply): забыть готовую разметку и прогреть заново
+  function resetFaces() { cache = {}; warmed = false; warm(); }
 
   // Тянем всю колоду и рубашку заранее. Без этого первая фигурная карта
   // появляется пустым белым прямоугольником, пока грузится картинка.
@@ -2211,13 +2935,106 @@ var ART = (function () {
     if (s.pat) { f.style.setProperty('--pat', rosette(s.pc, .5)); f.classList.add('pattern'); }
   }
 
-  return { faceHTML: faceHTML, faceSVG: faceSVG, pipSVG: pipSVG, SKINS: SKINS, TABLES: TABLES, applySkin: applySkin, warm: warm,
+  return { faceHTML: faceHTML, resetFaces: resetFaces, faceSVG: faceSVG, pipSVG: pipSVG, SKINS: SKINS, TABLES: TABLES, applySkin: applySkin, warm: warm,
     rosette: rosette, ava: ava, faceUrl: faceUrl, FACES: FACES, FACE_SEX: FACE_SEX, FACE_CH: FACE_CH,
     FACE_BIO: FACE_BIO,
     GOLD0: GOLD0,
     probeFaces: probeFaces, facesOf: facesOf, have: function () { return HAVE.slice(); },
     play: play, setSnd: setSnd, sndUrl: sndUrl,
     hasFaces: function () { return HAS; } };
+})();
+
+/* ============================================================
+   КОЛОДЫ И РУБАШКИ — общий модуль для всех карточных игр Malefictum.
+   Источник: board games/_колоды/pack/cards-lib.js (собирается make_lib.py).
+   В игру кладётся как src/p0c_cards.js без правок; подключается в build.py
+   сразу после p0_art.js. Инструкция: board games/_колоды/ВНЕДРЕНИЕ.md
+   ============================================================ */
+var CARDS = (function () {
+  'use strict';
+  var DECKS = [{"id": "atlas", "t": "Атласная", "y": "классика", "tier": 0, "cards": ["K", "Q", "J"], "aces": false, "base": true}, {"id": "atlas-vector", "t": "Атласная (вектор)", "y": "1911/1920-е, перерисовка", "tier": 1, "cards": ["A", "J", "K", "Q"], "aces": true, "back": "atlas-plaid-blue", "paper": "#ffffff"}, {"id": "lubok-1850", "t": "Лубочная", "y": "сер. XIX в., ручная раскраска", "tier": 2, "cards": ["J", "K", "Q"], "aces": false, "back": "lubok-marble", "paper": "#d6cbb3"}, {"id": "russian-style", "t": "Русский стиль (боярская)", "y": "ок. 1900", "tier": 2, "cards": ["A", "J", "K", "Q"], "aces": false, "back": "dondorf-russian", "paper": "#e5e0ce"}, {"id": "luxe-1860", "t": "Двухголовая «люкс»", "y": "сер. XIX в.", "tier": 3, "cards": ["J", "K", "Q"], "aces": false, "back": "luxe-1860", "paper": "#eae7db"}, {"id": "louis-xv", "t": "Стиль Людовика XV", "y": "кон. XIX в.", "tier": 3, "cards": ["A", "J", "K", "Q"], "aces": true, "back": "louis-xv", "paper": "#dfdad2"}];
+  var BACKS = [{"id": "atlas", "t": "Атласная клетка", "y": "классика", "tier": 0, "base": true}, {"id": "atlas-1sort", "t": "Атласная, 1-й сорт", "y": "1920-е", "tier": 0}, {"id": "atlas-plaid-green", "t": "Атласная, клетка (зелёно-красная)", "y": "1920-е, перерисовка", "tier": 0}, {"id": "atlas-plaid-blue", "t": "Атласная, клетка (сине-коричневая)", "y": "1920-е, перерисовка", "tier": 0}, {"id": "rosette-red", "t": "Розетка красная", "y": "традиционный рисунок", "tier": 0}, {"id": "rosette-blue", "t": "Розетка синяя", "y": "традиционный рисунок", "tier": 0}, {"id": "modern-red", "t": "Ромбы красные", "y": "современная", "tier": 0}, {"id": "modern-blue", "t": "Ромбы синие", "y": "современная", "tier": 0}, {"id": "dondorf-russian", "t": "Dondorf «Русский стиль»", "y": "кон. XIX в.", "tier": 1}, {"id": "grimaud-plaid", "t": "Grimaud, клетка", "y": "1860", "tier": 1}, {"id": "grimaud-aluette", "t": "Grimaud, узор", "y": "1858–1890", "tier": 1}, {"id": "polish-berlin", "t": "Берлинский узор, синяя", "y": "XIX в.", "tier": 1}, {"id": "ua-vyshyvanka-red", "t": "Вышиванка, красная", "y": "2026", "tier": 1}, {"id": "ua-vyshyvanka-blue", "t": "Вышиванка, синяя", "y": "2026", "tier": 1}, {"id": "ua-vyshyvanka-black", "t": "Вышиванка, чёрная", "y": "2026", "tier": 1}, {"id": "dodal-pink", "t": "Додаль, розовая", "y": "нач. XVIII в.", "tier": 1}, {"id": "napoli-cubes", "t": "Неаполитанская, кубы", "y": "XIX в.", "tier": 1}, {"id": "piedmont-1865", "t": "Пьемонтская", "y": "1865", "tier": 1}, {"id": "roman-leone", "t": "Римская «Al Leone»", "y": "XVIII в.", "tier": 1}, {"id": "ua-rushnyk", "t": "Рушник", "y": "2026", "tier": 1}, {"id": "minchiate-1870", "t": "Флорентийская", "y": "1860–1890", "tier": 1}, {"id": "swiss-1850", "t": "Швейцарская, звёзды", "y": "1850", "tier": 1}, {"id": "atlas-extra", "t": "Атласная «экстра»", "y": "1910-е", "tier": 2}, {"id": "ua-petrykivka-cream", "t": "Петриковка, светлая", "y": "2026", "tier": 2}, {"id": "ua-petrykivka-black", "t": "Петриковка, чёрная", "y": "2026", "tier": 2}, {"id": "ua-pysanka-red", "t": "Писанка, красная", "y": "2026", "tier": 2}, {"id": "ua-pysanka-black", "t": "Писанка, чёрная", "y": "2026", "tier": 2}, {"id": "lubok-marble", "t": "Рубашка колоды «Лубочная»", "y": "сер. XIX в., ручная раскраска", "tier": 2}, {"id": "fantasy-gold", "t": "Фэнтези", "y": "современная", "tier": 2}, {"id": "swiss-lausanne", "t": "Швейцарская, Лозанна", "y": "ок. 1900", "tier": 2}, {"id": "ua-kozak-crimson", "t": "Казацкая, малиновая", "y": "2026", "tier": 3}, {"id": "ua-kozak-blue", "t": "Казацкая, синяя", "y": "2026", "tier": 3}, {"id": "yellowbook-flowers", "t": "Модерн I", "y": "1894", "tier": 3}, {"id": "yellowbook-lilies", "t": "Модерн II", "y": "1894", "tier": 3}, {"id": "yellowbook-hares", "t": "Модерн III", "y": "1894", "tier": 3}, {"id": "yellowbook-birds", "t": "Модерн IV", "y": "1894", "tier": 3}, {"id": "luxe-1860", "t": "Рубашка колоды «Двухголовая «люкс»»", "y": "сер. XIX в.", "tier": 3}, {"id": "louis-xv", "t": "Рубашка колоды «Стиль Людовика XV»", "y": "кон. XIX в.", "tier": 3}];
+  var SUITS = ['S', 'H', 'D', 'C'];
+
+  // Базовые картинки игры запоминаем один раз — к ним возвращаемся при выборе «Атласной».
+  var BASE = {};
+  for (var k in IMG) BASE[k] = IMG[k];
+  // Однофайловая сборка (картинки вшиты data-URI): внешних колод в ней нет — показываем только базу.
+  var SINGLE = /^data:/.test(BASE.KS || '');
+
+  // ---------- открыто или закрыто ----------
+  // По умолчанию открыто всё. Игра подключает своё правило:
+  //   CARDS.setRule(function (item, kind) { return myRating() >= item.tier * 100; });
+  // item.tier: 0 — с самого начала, 1..3 — чем выше, тем позже открывается.
+  var rule = null;
+  function setRule(fn) { rule = typeof fn === 'function' ? fn : null; }
+  function isOpen(item, kind) {
+    if (!item) return false;
+    if (item.base) return true;
+    if (SINGLE) return false;
+    if (item.tier === 0) return true;
+    if (!rule) return true;
+    try { return !!rule(item, kind); } catch (e) { return false; }
+  }
+
+  function find(list, id) { for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i]; return null; }
+  function deck(id) { return find(DECKS, id); }
+  function back(id) { return find(BACKS, id); }
+
+  // ---------- пути ----------
+  function cardUrl(deckId, key) { return 'img/decks/' + deckId + '-' + key + '.webp'; }
+  function backUrl(backId) { return backId === 'atlas' ? BASE.back : 'img/backs/' + backId + '.webp'; }
+
+  // ---------- применение ----------
+  // Меняет IMG (фигуры, при полной четвёрке — и тузы) и рубашку стола.
+  // Закрытый или неизвестный выбор молча откатывается на «Атласную».
+  var cur = { deck: 'atlas', back: 'atlas' };
+  function apply(deckId, backId) {
+    var d = deck(deckId); if (!d || !isOpen(d, 'deck')) d = DECKS[0];
+    var b = back(backId); if (!b || !isOpen(b, 'back')) b = BACKS[0];
+    for (var key in BASE) IMG[key] = BASE[key];
+    delete IMG.AS; delete IMG.AH; delete IMG.AD; delete IMG.AC;
+    if (!d.base) {
+      d.cards.forEach(function (r) {
+        if (r === 'A' && !d.aces) return;
+        SUITS.forEach(function (s) { IMG[r + s] = cardUrl(d.id, r + s); });
+      });
+    }
+    IMG.back = backUrl(b.id);
+    cur = { deck: d.id, back: b.id };
+    if (typeof ART !== 'undefined' && ART.resetFaces) ART.resetFaces();
+    try { document.documentElement.style.setProperty('--backimg', 'url("' + IMG.back + '")'); } catch (e) { }
+    return cur;
+  }
+  function current() { return { deck: cur.deck, back: cur.back }; }
+  // Цвет бумаги выбранной колоды — им рисуются очковые карты, чтобы не спорили с фигурами.
+  // null — колода базовая, рисуем своим цветом.
+  function paper() { var d = deck(cur.deck); return d && d.paper || null; }
+
+  // ---------- плитки для окна настроек ----------
+  // Те же классы, что у выбора сукна (.skins / .skin / .on), плюс .locked.
+  // Атрибуты data-deck / data-back ловит общий обработчик кликов окна.
+  function tiles(kind, selId) {
+    var list = kind === 'deck' ? DECKS : BACKS;
+    return '<div class="skins cardpick">' + list.map(function (it) {
+      var open = isOpen(it, kind);
+      var img = kind === 'deck' ? (it.base ? BASE.KS : cardUrl(it.id, 'KS')) : backUrl(it.id);
+      return '<div class="skin' + (it.id === selId ? ' on' : '') + (open ? '' : ' locked') +
+        '" data-' + kind + '="' + it.id + '"' + (open ? '' : ' data-locked="1"') +
+        ' title="' + it.t + (it.y ? ' · ' + it.y : '') + '"' +
+        ' style="background-image:url(' + img + ')"><span>' + it.t + '</span></div>';
+    }).join('') + '</div>';
+  }
+
+  // Сколько открыто — для подписи «открыто 12 из 40»
+  function count(kind) {
+    var list = kind === 'deck' ? DECKS : BACKS, n = 0;
+    list.forEach(function (it) { if (isOpen(it, kind)) n++; });
+    return { open: n, all: list.length };
+  }
+
+  return { DECKS: DECKS, BACKS: BACKS, setRule: setRule, isOpen: isOpen, deck: deck, back: back,
+    apply: apply, current: current, paper: paper, single: SINGLE, tiles: tiles, count: count, cardUrl: cardUrl, backUrl: backUrl };
 })();
 
 /* ============================================================
@@ -6064,6 +6881,10 @@ var Net = (function () {
   function pubState(g) {
     return {
       N: g.N, names: g.names, o: g.o, target: g.target,
+      /* Номер партии один на стол — по нему рейтинг узнаёт свою заявку
+         и ловит двойной зачёт. Результат рейтинга хозяин кладёт сюда
+         один раз на итогах, гость забирает своё (`Boot.rtNet`). */
+      mid: g.mid || null, rating: g.rating || null,
       pool: g.pool, mountain: g.mountain, whists: g.whists,
       dealer: g.dealer, seats: g.seats, handNo: g.handNo,
       /* Ведомость едет вместе с состоянием: иначе вернувшийся за стол
@@ -6340,6 +7161,17 @@ var Net = (function () {
       if (UI && UI.toast) UI.toast((c.name || 'Игрок') + ' ушёл из-за стола');
       return;
     }
+    /* Партия окончена — ждать нечего: доигрывать больше не во что, а
+       пауза на итогах держит насос стола, и окно счёта не показывается
+       вовсе. Место просто пустеет. (Найдено в клаборе 31.10 — код
+       сетевой части общий.) */
+    if (S.game && S.game.over) {
+      c.away = 0; c.bot = false;
+      lobbyPush(); onState && onState();
+      if (UI && UI.toast) UI.toast((c.name || 'Игрок') + ' вышел из-за стола');
+      awayPush();
+      return;
+    }
     /* Помечаем МОМЕНТ обрыва, а не срок. Срока больше нет: бот сам на
        место не садится (см. ниже). */
     c.away = Date.now();
@@ -6413,7 +7245,10 @@ var Net = (function () {
     if (!c.conn) return false;
     var key = c.key;
     S.bans[key] = Date.now() + BAN_MS;
-    send(c.conn, { t: 'bye', why: 'Хозяин убрал вас со стола. Вернуться можно через минуту.' });
+    send(c.conn, { t: 'bye', rt: 'void', why: 'Хозяин убрал вас со стола. Вернуться можно через минуту.' });
+    /* Снимок убранного стираем: иначе хозяин мог бы высадить
+       проигрывающего и посчитать партию себе в плюс. */
+    if (S.game && S.game.stats) S.game.stats[seat] = null;
     try { c.conn.close(); } catch (e) { }
     c.conn = null; c.bot = true; c.name = ''; c.face = -1; c.stats = null; c.sent = 0;
     if (S.game) { S.game.names[seat] = 'Место ' + (seat + 1); }
@@ -6453,8 +7288,32 @@ var Net = (function () {
         for (i = 1; i < S.conns.length; i++)
           if (S.conns[i].uid && S.conns[i].uid === m.uid) { seat = i; break; }
         if (seat > 0 && S.conns[seat].conn && S.conns[seat].conn !== conn) {
-          try { send(S.conns[seat].conn, { t: 'bye', why: 'Вы вошли за этот стол из другого окна.' }); } catch (e) { }
-          try { S.conns[seat].conn.close(); } catch (e) { }
+          /* ---------- живой провод за местом не рвём ----------
+
+             Ник, 29.10 (нашлось в клаборе, беда общая): гость, у
+             которого мигнула связь, стучится несколько раз подряд —
+             первый стук сочли потерянным и начали второй, а ответ на
+             первый пришёл с опозданием. Для хозяина это два
+             «здравствуйте» с одним номером игрока, и он сажал
+             последнего, а прежнему слал «вы вошли из другого окна».
+             Прежний — ТА ЖЕ вкладка, и она уходила в меню: хозяин
+             видит место живым и ждёт хода, человек сидит в меню.
+             Дальше по кругу, пока стол не поднимут заново.
+
+             Призрака от эха отличает одно: когда этот провод в
+             последний раз подавал голос. Пульс ходит каждые `T.beat`,
+             поэтому молчание дольше трёх пульсов — призрак, его и
+             меняем. Провод, который только что говорил, не трогаем:
+             новому стуку отвечаем, что он лишний. */
+          var cur = S.conns[seat].conn;
+          var fresh = Math.max(2000, T.beat * 3);
+          if (cur.open && (Date.now() - (cur._seen || 0)) < fresh) {
+            send(conn, { t: 'bye', seated: true,
+              why: 'Вы уже за этим столом — играйте в том окне, где сидите.' });
+            return;
+          }
+          try { send(cur, { t: 'bye', why: 'Вы вошли за этот стол из другого окна.' }); } catch (e) { }
+          try { cur.close(); } catch (e) { }
           S.conns[seat].conn = null;
         }
       }
@@ -6462,6 +7321,26 @@ var Net = (function () {
       if (seat < 0 && m.key)
         for (i = 1; i < S.conns.length; i++)
           if (S.conns[i].key === m.key && !(S.conns[i].conn && S.conns[i].conn.open)) { seat = i; break; }
+      /* ---------- партия идёт — за стол садятся только свои ----------
+
+         Ник, 28.10 (сперва про клабор, но правило общее): «если игра
+         уже идёт, в неё должны садиться только те user с ID, которые
+         были на момент старта. Третий сесть к ним не должен. И не дай
+         бог заместить другого игрока».
+
+         Своих мы уже нашли выше — по номеру игрока (uid) или по ключу
+         места. Ниже идёт раздача ПУСТЫХ мест новичкам, а за идущим
+         столом пустых мест не бывает: место без соединения всегда
+         чьё-то — вылетевшего или бота, которого на него посадили.
+
+         До старта (в лобби) всё как было: кто пришёл, тот и сел. */
+      if (seat < 0 && S.ready) {
+        /* Канал не рвём: отказ должен доехать и объяснить, что
+           случилось, иначе человек увидит глухое «стол не отвечает». */
+        send(conn, { t: 'bye', rt: 'lost', why: 'Партия уже идёт. За этот стол могут вернуться ' +
+          'только те, кто играл за ним с начала.' });
+        return;
+      }
       /* Пустые места раздаём новичкам — но место, которое СЕЙЧАС держат
          за вылетевшим, не трогаем ни в какую: иначе он вернётся, а за
          его картами уже сидит чужой человек. */
@@ -6472,7 +7351,7 @@ var Net = (function () {
         for (i = 1; i < S.conns.length; i++) if (!S.conns[i].conn && !S.conns[i].away) { seat = i; break; }
       if (seat < 0) {
         var held = awayList().length;
-        send(conn, { t: 'bye', why: held
+        send(conn, { t: 'bye', rt: 'lost', why: held
           ? 'Все места заняты: одно держат за игроком, который вот-вот вернётся.'
           : 'Стол уже полон' });
         return;
@@ -6643,8 +7522,13 @@ var Net = (function () {
       LS('pref-room', S.code); LS('pref-name', myName);
       return new Promise(function (res, rej) {
         var done = false, tries = 0;
-        function ok2(v) { done = true; res(v); }
-        S._resolve = ok2;
+        function ok2(v) { done = true; S._resolve = S._reject = null; res(v); }
+        /* Отказ хозяина — такой же ответ, как согласие: ждать после
+           него нечего. Без этого стук в идущую партию кончался так:
+           человек видел причину, а через четырнадцать секунд вдогонку
+           глухое «стол не отвечает», будто стол ещё и сломан. */
+        function no2(e) { done = true; S._resolve = S._reject = null; rej(e); }
+        S._resolve = ok2; S._reject = no2;
         (function attempt() {
           tries++;
           var p = newPeer(null);
@@ -6652,7 +7536,10 @@ var Net = (function () {
           p.on('open', function () {
             keepAlive(p, 'гость');
             var conn = p.connect(PREFIX + S.code, { reliable: true });
-            S.conns = [conn];
+            /* Столом этот провод станет не сейчас, а когда хозяин
+               ответит «добро пожаловать» (ниже). Пока мы только
+               стучимся, и подменять им рабочий провод нельзя: брошенный
+               стук не должен уводить за собой стол. */
             conn.on('open', function () {
               S.lastHost = Date.now();
               send(conn, {
@@ -6662,29 +7549,42 @@ var Net = (function () {
               });
             });
             conn.on('data', function (m) {
+              /* «Добро пожаловать» приходит по тому проводу, который
+                 хозяин только что посадил за стол, — значит этот провод
+                 и есть стол. Всё, что приходит по старому, — эхо; его
+                 не слушаем, и сам он нам больше не нужен. */
+              if (m && m.t === 'welcome') S.conns = [conn];
+              if (S.conns[0] && conn !== S.conns[0]) { try { conn.close(); } catch (e) { } return; }
               S.lastHost = Date.now();
               if (m && m.t === 'pong') return;
               onGuestMsg(m, res);
             });
-            conn.on('close', function () { onLost(); });
-            conn.on('error', function () { if (!done) { done = true; rej(new Error('стол не отвечает')); } });
+            /* Обрыв считается обрывом СТОЛА только если оборвался тот
+               провод, которым мы за столом сидим. Закрытие брошенного
+               стука — не беда: мы его сами и погасили. */
+            conn.on('close', function () { if (S.conns[0] && conn === S.conns[0]) onLost(); });
+            conn.on('error', function () { if (!done) no2(new Error('стол не отвечает')); });
           });
           p.on('error', function (e) {
             if (done) return;
             var t = (e && e.type) || '';
+            /* Брокер ответил, а хозяина нет — считаем подряд: три раза
+               значит стол умер у хозяина, а не у нас (у нас бы и брокер
+               не ответил). Нужно рейтингу: гость в этом не виноват. */
+            if (t === 'peer-unavailable') S.hostMiss = (S.hostMiss || 0) + 1;
+            else if (TRANSIENT[t]) S.hostMiss = 0;
             /* Сокет к брокеру сорвался на полпути — это про связь, а не
                про стол: пробуем ещё раз, прежде чем пугать человека. */
             if (TRANSIENT[t] && tries < 3) {
               try { p.destroy(); } catch (e2) { }
               return setTimeout(attempt, 500 * tries);
             }
-            done = true;
             try { p.destroy(); } catch (e2) { }
             S.on = false; S.peer = null;
-            rej(new Error(netErr(e)));
+            no2(new Error(netErr(e)));
           });
         })();
-        setTimeout(function () { if (!done) { done = true; rej(new Error('стол не отвечает')); } }, 14000);
+        setTimeout(function () { if (!done) no2(new Error('стол не отвечает')); }, 14000);
       });
     });
   }
@@ -6704,8 +7604,21 @@ var Net = (function () {
       } catch (e) { }
       S.cfg = m.cfg;
       S.game = new NetGame(m.cfg, m.seat);
+      /* Стол у нас теперь НОВЫЙ объект, и показывать его должен тот же
+         `UI` — значит привязать его надо заново: первый же `sync`
+         сделает `UI.attach`. Иначе после возврата окно на экране есть
+         (от прежнего стола), а ответить в него нельзя — вопрос
+         приезжает в новый стол, а интерфейс живёт старым. */
+      S.ready = false;
       S.lost = false;
-      if (S._resolve) S._resolve(m);
+      if (S._resolve) { S._resolve(m); return; }
+      /* Ждать это «добро пожаловать» уже некому: наш стук сочли
+         неудачным и начали следующий, а ответ пришёл с опозданием. Всё
+         равно мы за столом — гасим цикл возврата и окно «Связь
+         прервалась». */
+      stopLoop();
+      if (UI && UI.closeModal) UI.closeModal();
+      if (UI && UI.toast) UI.toast('Вы снова за столом');
       return;
     }
     if (m.t === 'lobby') { S.lobby = m.players; if (UI && UI.lobbyRefresh) UI.lobbyRefresh(m.players); return; }
@@ -6736,7 +7649,23 @@ var Net = (function () {
       return;
     }
     if (m.t === 'bye') {
-      S.on = false; UI.toast(m.why || 'Стол закрыт');
+      /* Отказ «вы уже за этим столом» — ответ на лишний стук: стол на
+         месте, мы за ним сидим другим проводом. Гасим возврат и окно
+         «Связь прервалась», и живём дальше. */
+      if (m.seated) {
+        S.lost = false; stopLoop();
+        if (UI && UI.closeModal) UI.closeModal();
+        return;
+      }
+      S.on = false;
+      /* Поражение или нет — решает причина, а не сам факт прощания:
+         `void` снимает заявку без зачёта, `lost` засчитывает поражение,
+         `hold` и прощание без причины заявку не трогают. Заявку чужого
+         стола не трогаем вовсе — туда мы ещё можем вернуться. */
+      if (window.Boot && Boot.rtTableGone) { try { Boot.rtTableGone(m.rt || '', S.code); } catch (e) { } }
+      // ещё стучались — отдаём отказ тому, кто ждёт обещание входа
+      if (S._reject) { var no = S._reject; S._resolve = S._reject = null; no(new Error(m.why || 'Стол закрыт')); return; }
+      UI.toast(m.why || 'Стол закрыт');
       // высаженного гостя не оставляем перед мёртвым списком мест
       try { if (window.Boot && Boot.mainMenu) { UI.closeModal(); Boot.mainMenu(); } } catch (e) { }
       return;
@@ -6748,6 +7677,9 @@ var Net = (function () {
         g.applySync(m.pub, m.priv);
         g.pendHold = m.priv.pending || null;
         UI.attach(g, [], g.seat);
+        /* Заявка ставится и гостю тоже — когда к нему приехало первое
+           состояние стола. Без этого уход гостя не стоил бы ничего. */
+        if (window.Boot && Boot.rtStart) { try { Boot.rtStart(g); } catch (e) { } }
         UI.closeModal();
         UI.closeSplash();                         // партия началась — убираем лобби со стола
         if (window.Boot && Boot.toTable) Boot.toTable();   // мы снова за столом
@@ -6814,6 +7746,7 @@ var Net = (function () {
     if (looping) return looping;
     clearTimeout(backT); loopStop = false;
     var n = 0, code = S.code;
+    S.hostMiss = 0;                 // считаем заново: это новый круг возврата
     looping = new Promise(function (res, rej) {
       (function once() {
         if (loopStop || S.host || S.code !== code) { looping = null; return rej(new Error('стол уже не тот')); }
@@ -6824,7 +7757,7 @@ var Net = (function () {
            мы собираемся до конца. */
         S.on = true;
         reconnect().then(function (w) {
-          S.lost = false; looping = null; res(w);
+          S.lost = false; S.hostMiss = 0; looping = null; res(w);
         }, function () {
           if (n >= (limit || 40)) { looping = null; return rej(new Error('стол не отозвался')); }
           backT = setTimeout(once, Math.min(6000, 1200 + n * 400));
@@ -6849,7 +7782,7 @@ var Net = (function () {
       for (var i = 1; i < S.conns.length; i++) {
         var c = S.conns[i];
         if (!c || !c.conn) continue;
-        try { send(c.conn, { t: 'bye', why: why || 'Партия окончена, стол закрыт.' }); } catch (e) { }
+        try { send(c.conn, { t: 'bye', rt: 'void', why: why || 'Партия окончена, стол закрыт.' }); } catch (e) { }
       }
       dropSaved();
       setTimeout(leave, 400);
@@ -6863,7 +7796,7 @@ var Net = (function () {
       if (S.game) saveHost(S.game);
       for (var i = 1; i < S.conns.length; i++) {
         var c = S.conns[i];
-        if (c && c.conn) send(c.conn, { t: 'bye', later: true,
+        if (c && c.conn) send(c.conn, { t: 'bye', later: true, rt: 'hold',
           why: 'Хозяин отложил партию. Доиграете потом: «Вернуться за стол» в главном меню, когда он снова поднимет стол.' });
       }
       setTimeout(leave, 400);                 // прощание уходит по проводу — рвём связь не сразу
@@ -6886,10 +7819,25 @@ var Net = (function () {
   }
 
   function leave() {
+    /* ---------- сначала забываем стол, потом рвём провод ----------
+
+       Порядок тут не косметика. `peer.destroy()` закрывает наши
+       соединения, а на закрытие ТЕКУЩЕГО провода у нас заведён
+       `onLost` — «связь прервалась, возвращаем вас за стол». Пока стол
+       ещё числился нашим, уход кнопкой выглядел для игры обрывом:
+       поднималось окно возврата, цикл стучался заново — и человек,
+       который только что вышел, молча садился обратно. Хозяин при этом
+       даже не замечал, что тот уходил, и место за столом оставалось
+       «живым» — а значит, брошенная партия не считалась брошенной.
+
+       В клаборе это нашли и починили 30.10.2026; здесь тот же код жил
+       неисправленным. Состояние гасим ПЕРЕД тем, как рвать: закрытие
+       застаёт пустой стол и никого не зовёт. */
     stopLoop();
-    try { if (S.peer) S.peer.destroy(); } catch (e) { }
+    var p = S.peer;
     S.on = false; S.host = false; S.ready = false; S.peer = null; S.conns = []; S.game = null;
     S.away = []; S.lost = false; S.lastHost = 0;
+    try { if (p) p.destroy(); } catch (e) { }
     if (UI && UI.netAway) UI.netAway([]);
   }
 
@@ -6938,6 +7886,10 @@ var Net = (function () {
     setBroker: setBroker, testBroker: testBroker,
     myUid: myUid, setUid: setUid, newUid: newUid,
     savedBack: savedBack, dropBack: dropBack,
+    /* Стол умер у хозяина, а не у нас: брокер трижды подряд ответил
+       «такого нет» — значит он доступен, а комнаты уже нет. Рейтинг по
+       этому признаку снимает заявку гостя без поражения. */
+    hostGone: function () { return !!S.lost && (S.hostMiss || 0) >= 3; },
     chat: chat, bub: bub,
     loadPeer: loadPeer, PREFIX: PREFIX, send: send,
     names: names, lobbyPush: lobbyPush, swapSeats: swapSeats, kick: kick, lobbyList: function () { return S.lobby || []; }, NetGame: NetGame, rndKey: rndKey, LS: LS,
@@ -7202,9 +8154,10 @@ var Hall = (function () {
     if (!who) return;
     if (m.t === 'msg') return broadcastMsg(who.name, String(m.text || '').slice(0, 200), who.id);
     if (m.t === 'table') {
-      who.table = m.code ? { code: String(m.code).slice(0, 6), N: m.N || 3 } : null;
-      if (who.table) tableLine(who.name, who.table.code, who.table.N, who.id);
-      else line('sys', who.name + ' закрыл стол.');
+      var had = who.table && who.table.code;
+      who.table = m.code ? { code: String(m.code).slice(0, 6), N: m.N || 3, go: !!m.go } : null;
+      if (who.table && who.table.code !== had) tableLine(who.name, who.table.code, who.table.N, who.id);
+      else if (!who.table && had) line('sys', who.name + ' закрыл стол.');
       pushList();
       return;
     }
@@ -7318,16 +8271,22 @@ var Hall = (function () {
   }
 
   // объявить, что я поднял стол (или закрыл его)
-  function table(code, N) {
+  /* `go` — за столом уже играют. Пока стол в лобби, в комнату зовут;
+     как партия началась — зовут зря: хозяин такого стола пускает
+     только своих (см. p7_net, `hello`), и кнопка «Подключиться» только
+     обманывает. Строку в разговор пишем ТОЛЬКО про новый стол:
+     обновление пометки — не новость. */
+  function table(code, N, go) {
     if (!H.ready) return;
-    H.me.table = code ? { code: code, N: N } : null;
+    var was = H.me.table && H.me.table.code;
+    H.me.table = code ? { code: code, N: N, go: !!go } : null;
     if (H.host) {
       var m = H.members.filter(function (x) { return x.id === 'host'; })[0];
       if (m) m.table = H.me.table;
-      if (code) tableLine(H.me.name, code, N, H.me.id);
-      else line('sys', 'Вы закрыли стол.');
+      if (code && code !== was) tableLine(H.me.name, code, N, H.me.id);
+      else if (!code && was) line('sys', 'Вы закрыли стол.');
       pushList();
-    } else Net.send(H.hostConn, { t: 'table', code: code || null, N: N || 0 });
+    } else Net.send(H.hostConn, { t: 'table', code: code || null, N: N || 0, go: !!go });
   }
 
   /* ---------- где человек сейчас ----------
@@ -7948,9 +8907,14 @@ var UI = (function () {
        по сети, и в массиве лежат `null`. Подпись и рисование обязаны это
        переживать — на первой же сдаче гость валился с «Cannot read
        properties of null». */
-    var sig = (open ? 'o:' : 'c:') + g.widow.map(function (c) {
-      return (c && c.r) ? K.id(c) : '?';
-    }).join(',');
+    /* Колода — часть подписи: иначе сменивший её посреди сдачи увидит
+       в прикупе картинки от старой колоды, пока прикуп не поменяется
+       сам (а он до конца сдачи не меняется). */
+    var sig = (open ? 'o:' : 'c:') +
+      (typeof CARDS !== 'undefined' ? CARDS.current().deck + ':' : '') +
+      g.widow.map(function (c) {
+        return (c && c.r) ? K.id(c) : '?';
+      }).join(',');
     if (w.dataset.sig === sig) return;              // ничего не поменялось — не трогаем
     w.dataset.sig = sig;
     w.innerHTML = '';
@@ -8974,6 +9938,10 @@ var UI = (function () {
       case 'over':
         drawAll();
         if (window.Boot && Boot.achGame) { try { Boot.achGame(g); } catch (err) { } }
+        /* Рейтинг — там же, где счёт. У хозяина считается за всех и
+           уезжает гостям в состоянии партии; гость своё примет, когда
+           оно доедет (`rtNet`). */
+        if (window.Boot && Boot.rtFinish) { try { Boot.rtFinish(g); } catch (err) { } }
         wait(400, function () { showOver(); next(); });
         return;
 
@@ -9550,6 +10518,16 @@ var UI = (function () {
       }).join('') + '</div>';
   }
 
+  /* Звёзды на итогах: человек только что доиграл пульку — пусть видит,
+     где он теперь. Число рейтинга не показываем, оно ничего не говорит. */
+  function rtResHTML() {
+    try {
+      if (window.Boot && Boot.rating && Boot.rtBlock)
+        return '<div class="rtres">' + Boot.rtBlock(Boot.rating(), true) + '</div>';
+    } catch (e) { }
+    return '';
+  }
+
   function showOver() {
     var sc = settle(g), best = 0, i, j;
     for (i = 1; i < g.N; i++) if (sc[i] > sc[best]) best = i;
@@ -9573,7 +10551,7 @@ var UI = (function () {
       '<div class="sub">Итог в вистах: гора вычитается из пули, и за каждое очко разницы ' +
       'идёт по десять вистов с каждого соперника. Взаимные висты сворачиваются, ' +
       'сумма по столу — ноль: что один выиграл, то другие заплатили.</div>' +
-      roundsHTML() + achOverHTML() +
+      rtResHTML() + roundsHTML() + achOverHTML() +
       '<div class="row"><button class="btn big" id="bAgain">Ещё партию</button>' +
       '<button class="btn" id="bMenu">В меню</button></div>',
       function (m) {
@@ -9749,6 +10727,10 @@ var UI = (function () {
 
   /* ---------- сеть ---------- */
   function netEvents(list) {
+    /* Результат рейтинга приезжает в состоянии партии и может прийти
+       как до окна итогов, так и после — поэтому смотрим на каждом
+       обновлении, а дважды одно и то же не применится. */
+    if (window.Boot && Boot.rtNet) { try { Boot.rtNet(g); } catch (e) { } }
     for (var i = 0; i < list.length; i++) g.ev.push(list[i]);
     pump();
   }
@@ -9766,6 +10748,16 @@ var UI = (function () {
      здесь же. */
   var awayT = null, awayTill = {}, awayWho = [];
   function netAway(list) {
+    /* ---------- партия окончена — ждать некого ----------
+
+       Ник, 31.10, по клабору: «баг в конце партии — не выкидывает
+       игроков в лобби; игроки вышли по факту, а у игрока висит баг».
+       Последняя сдача доиграна, движок уже поставил `over`, а события
+       итога ещё в очереди стола. В эту секунду у гостя рвётся провод —
+       поднимается пауза «ждём игрока», насос встаёт, и окно итога не
+       показывается НИКОГДА. А ждать нечего: доигрывать не во что.
+       Код сетевой части у преферанса общий с клабором — чиним парой. */
+    if (g && g.over) list = [];
     awayWho = list || [];
     var box = document.getElementById('await');
     clearInterval(awayT); awayT = null;
@@ -9819,10 +10811,15 @@ var UI = (function () {
     var say = function (t) { var el = document.getElementById('lostT'); if (el) el.textContent = t; };
     modal('<h3>Связь прервалась</h3>' +
       '<p id="lostT">Возвращаем вас за стол — место держат за вами. Попытка 1…</p>' +
+      '<div class="sub">Уйти отсюда — то же самое, что бросить партию: она ' +
+      'засчитается поражением. Если стола уже нет — поражения не будет.</div>' +
       '<div class="row"><button class="btn wide" data-lost="1">Выйти в меню</button></div>',
       function (m) {
         var x = m.querySelector('[data-lost]');
         if (x) x.onclick = function () {
+          /* Заявку закрываем ДО `leave()`: он гасит состояние сети, и
+             `rtQuit` уже не отличит «стол умер» от «я ушёл». */
+          try { if (window.Boot && Boot.rtQuit) Boot.rtQuit(); } catch (e) { }
           try { Net.leave(); } catch (e) { }
           closeModal();
           if (window.Boot && Boot.mainMenu) Boot.mainMenu();
@@ -9880,7 +10877,64 @@ var UI = (function () {
      Книжку складываем из состояния, а дальше стол живёт как обычно. */
   function resume() { hbFromState(); evIdx = g.ev.length; pump(); }
 
+  /* ---------- страж стола ----------
+
+     Цепочка «событие → показ → следующий ход» вся собрана на обратных
+     вызовах: каждый шаг обязан позвать следующий. Потеряется один
+     вызов — и стол стоит навсегда: насос занят, `ready` больше не
+     позовут, а на экране живая подсказка «такой-то думает над ходом».
+     Игроки клабора это и видели — там нашлась своя причина (окно,
+     закрываясь, не снимало паузу стола; у преферанса такой дыры нет,
+     вопросы заперты от Escape). Но причина — одна из, а цепочка общая,
+     и дважды одну и ту же беду ловить незачем.
+
+     Страж не лечит причины: он не даёт столу умереть от следующей. Раз
+     в две секунды смотрит, не стоит ли стол при живом вопросе, и если
+     стоит десять секунд — отпускает насос и спрашивает ход заново.
+
+     Чего страж НЕ трогает: открытое окно и экран (человек думает),
+     сетевую паузу (стол и должен ждать вылетевшего) и свой ход
+     человека, когда карту в руке можно положить. */
+  var guardT = null, guardStamp = '', guardSince = 0, guardAt = -1, guardN = 0;
+  /* Вопрос к столу — это `pending`, а у гостя по сети ещё и `pendHold`:
+     присланный вопрос лежит там, пока доигрывается анимация, и только
+     `ready` переносит его в `pending`. Оборвись цепочка ДО этого —
+     `pending` так и остался бы пустым, а ход за человеком есть. Страж
+     смотрит на оба. */
+  function anyPend() { return g && (g.pending || (g.isNet && g.pendHold)); }
+  function tableStamp() {
+    if (!g) return '';
+    var q = anyPend();
+    return [g.handNo, g.ev ? g.ev.length : 0, evIdx, q ? q.type + q.p : '-',
+      g.cur ? g.cur.length : 0, pumping, pausedUI, netHold].join('/');
+  }
+  function guardOK() { guardSince = Date.now(); }
+  function guard() {
+    if (!g || g.over || !anyPend()) { guardSince = 0; return; }
+    var st = tableStamp();
+    if (st !== guardStamp || !guardSince) { guardStamp = st; return guardOK(); }
+    if (Date.now() - guardSince < 10000) return;
+    if ($('#modal').classList.contains('on') || $('#splash').classList.contains('on')) return guardOK();
+    if (netHold) return guardOK();
+    var q = anyPend();
+    if (q.p === ME && q.type === 'play' && $('#hand .card.playable')) return guardOK();
+    guardOK();
+    /* Поднимаем стол: своей паузы без единого окна быть не может,
+       занятого насоса без хода — тоже. */
+    pausedUI = false; pumping = false; needReady = false; repause();
+    if (evIdx < g.ev.length) {
+      /* Спотыкаемся на одном и том же событии второй раз — значит шаг
+         бросает исключение. Пропускаем его: партия дороже одной
+         анимации. */
+      if (guardAt === evIdx && ++guardN > 1) { evIdx++; guardN = 0; }
+      else if (guardAt !== evIdx) { guardAt = evIdx; guardN = 1; }
+      return pump();
+    }
+    ready();
+  }
+
   function bindOnce() {
+    if (!guardT) guardT = setInterval(guard, 2000);
     /* «Посадить бота» в плашке ожидания: хозяин решил не ждать. */
     document.addEventListener('click', function (ev) {
       var ab = ev.target.closest('[data-awbot]');
@@ -10216,7 +11270,7 @@ var Boot = (function () {
      в клаборе: чтобы с одного взгляда было видно, КАКАЯ версия сейчас
      открыта. Без него легко час спорить, почему правка «не работает»,
      когда на самом деле открыта старая заливка. */
-  var BUILD = '22.10 13:33';
+  var BUILD = '31.10 22:32';
 
   function ls(k, d) {
     try { var v = localStorage.getItem('pref-' + k); return v == null ? d : v; } catch (e) { return d; }
@@ -10229,6 +11283,8 @@ var Boot = (function () {
     talk: ls('talk', '1') === '1',   // трёп; команды звучат всегда
     snd: ls('snd', '1') === '1',
     face: +ls('face', -1),
+    deck: ls('deck', 'atlas'),       // колода и рубашка — личные, по сети не едут
+    back: ls('back', 'atlas'),
     conv: ls('conv', 'finka'),       // роспись по умолчанию — одесская финка
     raz: ls('raz', '0') === '1',     // разбойник — заказной преферанс
     card: ls('card', 'short'),       // карточка разбойника: короткая или полная
@@ -10243,6 +11299,7 @@ var Boot = (function () {
     lsSet('level', CFG.level); lsSet('talk', CFG.talk ? '1' : '0');
     lsSet('snd', CFG.snd ? '1' : '0'); lsSet('face', CFG.face);
     lsSet('conv', CFG.conv); lsSet('players', CFG.players); lsSet('target', CFG.target);
+    lsSet('deck', CFG.deck); lsSet('back', CFG.back);
     lsSet('raz', CFG.raz ? '1' : '0'); lsSet('card', CFG.card);
     lsSet('mychar', CFG.myChar);
   }
@@ -10397,6 +11454,260 @@ var Boot = (function () {
      понятно, сколько вообще наиграно, а не только каким вышел итог. */
   function vistNet(st) { return (st.vWon || 0) - (st.vLost || 0); }
 
+
+  /* ============================================================
+     РЕЙТИНГ ИГРОКА — ЗВЁЗДЫ
+
+     Общий модуль платформы (`src/p2r_rating.js`, документация —
+     `../платформа/09-РЕЙТИНГ.md`). Модуль не правим: всё своё — через
+     `Rating.config`. Единица в преферансе — пулька, результат места —
+     итоговые висты после расчёта (сумма по столу ноль).
+
+     Главное правило: БРОСИЛ ПАРТИЮ — ПОРАЖЕНИЕ. Поэтому поражение
+     пишется заранее, заявкой: закрытую вкладку поймать нельзя
+     (`beforeunload` ненадёжен, на телефоне не срабатывает вовсе).
+     Заявка кладётся на старте партии и снимается только на итогах,
+     после записи рейтинга. Ушёл в меню, закрыл вкладку, не вернулся
+     после вылета — заявка найдётся и засчитается поражением.
+     ============================================================ */
+  var RCFG = Rating.config('preferans', {
+    /* ---------- замер, а не догадка ----------
+
+       31.10.2026, `calib_rating.js`: боты всех трёх уровней за одним
+       столом, 800 пулек до 10, роспись «финка» — основной режим игры,
+       как у людей. Сдач сыграно 11 195.
+
+         1 против 2   37.0 : 63.0
+         1 против 3   36.0 : 64.0
+         2 против 3   47.0 : 53.0
+
+       Отсюда рейтинги ниже. Главное, что видно в замере: КАТАЛА ПОЧТИ
+       НЕ СИЛЬНЕЕ ДВОРОВОГО — 53:47 на 798 пульках. В пульке решает
+       торговля и расклад, а перебор в концовке отыгрывает слишком
+       мало. Для шкалы это значит, что 3★ и 4★ стоят в семнадцати
+       очках друг от друга, то есть почти слиты: настоящим порогом 4★
+       пока работает потолок по стажу (30 партий). Чинится это не
+       числами, а ботом — сильный уровень надо усиливать. На глаз
+       рейтинги не трогать: только новым замером. */
+    bots: { 1: 1412, 2: 1500, 3: 1517 },
+    /* 80-й процентиль |разницы вистов| между двумя игроками в тех же
+       пульках: столько — уже разгром, а не «выиграл впритык».
+       Медиана для сравнения — 170. */
+    scoreMargin: 353
+  });
+  var RT_KEY = 'preferans-rating', RT_PEND = 'preferans-rating-pend';
+
+  function rtLoad() {
+    var raw = null;
+    try { raw = JSON.parse(localStorage.getItem(RT_KEY) || 'null'); } catch (e) { }
+    return Rating.normalize(RCFG, raw);
+  }
+  function rtSave(st) { try { localStorage.setItem(RT_KEY, JSON.stringify(st)); } catch (e) { } }
+  function rtPend() {
+    try { return JSON.parse(localStorage.getItem(RT_PEND) || 'null'); } catch (e) { return null; }
+  }
+  function rtPendSave(p) {
+    try { p ? localStorage.setItem(RT_PEND, JSON.stringify(p)) : localStorage.removeItem(RT_PEND); } catch (e) { }
+  }
+  function rtBump(k) {
+    var st = stats(); st[k] = (st[k] || 0) + 1; saveStats(st);
+  }
+
+  /* Кто за каким местом сидит — одним списком и для заявки, и для
+     итогов. `fin` — класть ли итоговый счёт (на старте его ещё нет).
+
+     Бот — уровнем, живой — состоянием рейтинга. Состояние гостя едет к
+     хозяину в карточке профиля (`statCard().rt`) и лежит в `g.stats`.
+     Место, с которого человек ушёл и не вернулся, — это ЕГО место с
+     пометкой `left`, а не бот: бот за него только доигрывал. */
+  function rtSeats(g, fin) {
+    var out = [], i, me = UI.me(), net = !!(window.Net && Net.S && Net.S.on);
+    var sc = null;
+    if (fin) { try { sc = K.settle(g.pool, g.mountain, g.whists); } catch (e) { sc = null; } }
+    for (i = 0; i < g.N; i++) {
+      var s = { key: String(i) };
+      if (fin) s.score = sc ? Math.round(sc[i]) : 0;
+      if (i === me) s.state = rtLoad();
+      else if (!net) s.bot = g.lvl || CFG.level;
+      else {
+        var c = (Net.S.host && Net.S.conns) ? Net.S.conns[i] : null;
+        var rt = g.stats && g.stats[i] && g.stats[i].rt;
+        var live = Net.S.host ? !!(c && c.conn && !c.bot) : !!rt;
+        if (live) s.state = rt || null;
+        else if (rt) { s.state = rt; s.left = true; }   // человек был и не вернулся
+        else s.bot = (g.lvl || CFG.level);
+      }
+      out.push(s);
+    }
+    return out;
+  }
+
+  /* Партия началась — кладём заявку. Если лежит заявка от ДРУГОЙ
+     партии, значит ту бросили: засчитываем её поражением здесь же.
+     Это же закрывает «начал новую партию поверх сохранённой». */
+  var rtDone = '';          // партия, по которой уже всё решено
+  function rtStart(g) {
+    if (!g || !g.mid) return;
+    /* По этой партии уже записано — или итог, или поражение. Второй
+       заявки на неё быть не должно: запоздалое состояние со стола
+       иначе заводило бы её заново, и человек получал бы поражение
+       дважды за один и тот же уход. */
+    if (String(g.mid) === rtDone) return;
+    var p = rtPend();
+    if (p && String(p.id) === String(g.mid)) return;        // та же партия — заявка на месте
+    if (p) rtForfeit(p, true);
+    rtPendSave(Rating.pending(RCFG, { id: g.mid, mode: 'score', seats: rtSeats(g, false) }, String(UI.me())));
+  }
+
+  /* Засчитать брошенную партию поражением. `quiet` — без строки на
+     экране (когда человек сам нажал «выйти», он и так предупреждён). */
+  function rtForfeit(p, quiet) {
+    if (!p) return null;
+    var r = Rating.forfeit(RCFG, rtLoad(), p);
+    rtDone = String(p.id);
+    rtPendSave(null);
+    if (r.skipped) return null;
+    rtSave(r.state);
+    rtBump('rtLeft');
+    if (!quiet && window.UI && UI.toast) UI.toast('Незаконченная партия засчитана поражением');
+    return r;
+  }
+
+  /* Человек сам уходит из идущей партии. Зовётся из кнопок выхода. */
+  function rtQuit() {
+    var p = rtPend();
+    if (!p) return false;
+    /* Партию с ботами можно продолжить — её сохранение остаётся, и
+       уходом в меню она не бросается. Бросается она тогда, когда
+       поверх неё начинают новую (это ловит `rtStart`). */
+    if (!isNet() && savedGame()) return false;
+    /* Стол умер у хозяина (брокер трижды сказал «нет такого») — гость
+       не бросал партию, заявку снимаем без поражения. */
+    if (isNet() && Net.hostGone && Net.hostGone()) { rtPendSave(null); return false; }
+    rtForfeit(p, true);
+    return true;
+  }
+
+  /* Итоги партии: записать рейтинг и снять заявку. У хозяина — за всех,
+     и результат уезжает гостям в состоянии партии. */
+  function rtFinish(g) {
+    if (!g || !g.mid) return null;
+    var net = !!(window.Net && Net.S && Net.S.on);
+    if (net && !Net.S.host) return null;              // гость ждёт ответа хозяина
+    var res = Rating.applyMatch(RCFG, { id: g.mid, mode: 'score', seats: rtSeats(g, true) });
+    var mine = res.states[String(UI.me())];
+    if (mine) rtSave(mine);
+    /* Снимки гостей у хозяина (g.stats[i].rt) приехали в hello ДО этой
+       партии. Не обновить — следующую партию за этим же столом хозяин
+       посчитал бы от старого состояния, и гость потерял бы эту. */
+    Object.keys(res.states).forEach(function (k) {
+      var i = +k, ns = res.states[k];
+      if (g.stats && g.stats[i]) g.stats[i].rt = ns;
+      var c = window.Net && Net.S && Net.S.conns && Net.S.conns[i];
+      if (c && c.stats) c.stats.rt = ns;
+    });
+    rtDone = String(g.mid);
+    rtPendSave(null);
+    if (net) {
+      g.rating = { id: String(g.mid), res: res.states, d: res.deltas };
+      try { Net.broadcast(g); } catch (e) { }
+    }
+    return res;
+  }
+
+  /* Гость: хозяин прислал результат партии — принять своё и снять
+     заявку. Зовётся на каждом обновлении состояния, поэтому дважды
+     одно и то же не применяется (за этим следит `adopt` по id). */
+  var rtTaken = '';
+  function rtNet(g) {
+    if (!g || !g.rating || !isNet() || Net.S.host) return;
+    var R = g.rating, me = String(UI.me());
+    if (String(R.id) === rtTaken) return;
+    rtTaken = String(R.id);
+    var got = R.res && R.res[me];
+    if (got) rtSave(Rating.adopt(RCFG, rtLoad(), got, R.id, R.d && R.d[me]));
+    rtDone = String(R.id);
+    var p = rtPend();
+    if (p && String(p.id) === String(R.id)) rtPendSave(null);
+  }
+
+  /* Запуск игры: лежит заявка — значит прошлую партию не доиграли.
+     Продолжить можно только ту же самую: сохранённую с ботами или
+     стол, на который есть запись возврата. Иначе — поражение. */
+  function rtBoot() {
+    var p = rtPend();
+    if (!p) return;
+    var id = String(p.id);
+    if (id.charAt(0) === 's') {
+      var d = savedGame();
+      if (d && String(d.mid || '') === id) return;              // продолжим — заявка ждёт
+    } else {
+      var code = id.split('-')[0];
+      var back = Net.savedBack && Net.savedBack(), host = Net.savedHost && Net.savedHost();
+      /* ждём возврата за стол, но не вечно: неделя — и это поражение */
+      if (((back && back.code === code) || (host && host.code === code)) &&
+        !Rating.holdExpired(RCFG, p)) return;
+    }
+    rtForfeit(p, false);
+  }
+
+  /* Стол исчез не по нашей вине: хозяин закрыл или высадил. Заявку
+     снимаем без поражения — доигрывать было нечего. */
+  function rtTableGone(why, code) {
+    var p = rtPend();
+    if (!p || String(p.id).charAt(0) === 's') return;
+    // заявка от другого стола — не наше дело (мы, может, туда ещё вернёмся)
+    if (code && String(p.id).split('-')[0] !== String(code)) return;
+    if (why === 'void') rtPendSave(null);         // закрыл/убрал хозяин — без поражения
+    else if (why === 'lost') rtForfeit(p, false); // места за нами больше нет — бросил
+    // 'hold' (отложено) и без причины — заявку не трогаем
+  }
+
+  /* ---------- показ ----------
+     Игроку показываем звёзды, а не число: число рейтинга само по себе
+     ничего не говорит, а «три с половиной из пяти» говорит. */
+  function rtStars(st) { return Rating.starsHTML(RCFG, st || rtLoad()); }
+  function rtPlural(n, a, b, c) {
+    var d = n % 100;
+    if (d > 10 && d < 20) return c;
+    d = n % 10;
+    return d === 1 ? a : (d > 1 && d < 5) ? b : c;
+  }
+
+  /* Строка под звёздами: что они значат и сколько сыграно. */
+  function rtLine(st) {
+    var v = Rating.view(RCFG, st || rtLoad());
+    if (v.calibrating)
+      return 'Ещё ' + v.left + ' ' + rtPlural(v.left, 'пулька', 'пульки', 'пулек') +
+        ' — и появятся звёзды. Они показывают, на равных ли вы со столом.';
+    var w = v.stars >= 4.5 ? 'сильнее сильного бота'
+      : v.stars >= 4 ? 'на равных с сильным ботом'
+        : v.stars >= 3 ? 'на равных со средним ботом'
+          : v.stars >= 2 ? 'на равных со слабым ботом' : 'пока слабее слабого бота';
+    return w + ' · пулек ' + v.games + ', из них с людьми ' + v.human +
+      (v.abandoned ? ', брошено ' + v.abandoned : '') +
+      (v.peak > v.stars ? ' · лучшее было ' + Rating.starsText(v.peak) : '');
+  }
+
+  /* Блок рейтинга: крупные звёзды и строка смысла. */
+  function rtBlock(st, mine) {
+    var v = Rating.view(RCFG, st);
+    return '<div class="rtbox"><div class="rtbig">' + Rating.starsHTML(RCFG, v) + '</div>' +
+      '<div class="sub" style="margin:4px 0 0">' + (mine ? rtLine(st) : rtLineOther(v)) + '</div></div>';
+  }
+  function rtLineOther(v) {
+    if (v.calibrating) return 'Рейтинг ещё считается: сыграно ' + v.games + ' из ' + RCFG.calibrationGames + '.';
+    return 'Пулек ' + v.games + ', из них с людьми ' + v.human +
+      (v.abandoned ? ', брошено ' + v.abandoned : '');
+  }
+
+  /* Номер партии: один на стол, одинаковый у всех. По нему же ловится
+     двойной зачёт — и у хозяина, и у гостя. */
+  function rtMid(net) {
+    var t = Date.now().toString(36);
+    return net ? (Net.S.code + '-' + t) : ('s' + t);
+  }
+
   /* ---------- партия с ботами ---------- */
   var G = null;
   /* ---------- сохранённая партия с ботами ----------
@@ -10413,7 +11724,9 @@ var Boot = (function () {
       if (window.Net && Net.S && Net.S.on) return;        // сетевой стол — не наше дело
       if (!g || g.over) { localStorage.removeItem(SKEY); return; }
       localStorage.setItem(SKEY, JSON.stringify({
-        v: 2, t: Date.now(), me: 0, faces: g.faces || null, g: g.save()
+        v: 2, t: Date.now(), me: 0, faces: g.faces || null,
+        mid: g.mid || null,                 // номер партии — по нему рейтинг узнаёт свою заявку
+        g: g.save()
       }));
     } catch (e) { }
   }
@@ -10434,10 +11747,12 @@ var Boot = (function () {
     if (!g) { dropSave(); return; }
     G = g;
     G.faces = d.faces || null;
+    G.mid = d.mid || rtMid(false);        // со старого сохранения номера может не быть
     achRunReset();
     UI.closeSplash(); UI.closeModal();
     toTable();
     UI.attach(G, [], d.me || 0);
+    rtStart(G);                           // та же заявка: продолжаем, а не бросаем
     if (window.Hall && Hall.where) Hall.where('bots');   // продолженная партия — такая же партия
     UI.resume();
   }
@@ -10463,10 +11778,13 @@ var Boot = (function () {
       ? { razboynik: true, card: (CFG.card === 'full' ? K.CARD_FULL : K.CARD_SHORT) }
       : {}));
     G.faces = faces;
+    G.lvl = CFG.level;
+    G.mid = rtMid(false);                 // номер партии — для рейтинга
     achRunReset();
     toTable();
     UI.closeSplash(); UI.closeModal();
     UI.attach(G, [], 0);
+    rtStart(G);                           // заявка: бросишь — засчитается поражением
     if (window.Hall && Hall.where) Hall.where('bots');   // из комнаты не уходим — помечаемся
     UI.begin();
   }
@@ -10994,7 +12312,10 @@ var Boot = (function () {
       function (m) {
         if (sv) m.querySelector('#mResume').onclick = resumeGame;
         if (hostSv) m.querySelector('#mHostResume').onclick = function () { resumeHost(hostSv, this); };
-        m.querySelector('#mStart').onclick = newGameDialog;
+        /* Новая партия поверх недоигранной — та засчитается
+           поражением (это делает `rtStart`). Человек должен знать об
+           этом до, а не после. */
+        m.querySelector('#mStart').onclick = function () { rtAskNew(newGameDialog); };
         m.querySelector('#mJoin').onclick = function () { scrJoin(''); };
         if (back) m.querySelector('#mBack').onclick = function () { resumeBack(back); };
         m.querySelector('#mHall').onclick = scrHost;
@@ -11287,6 +12608,7 @@ var Boot = (function () {
         '<div class="profhead">' + ART.ava(CFG.face, 'Я', 'big') +
         '<div><div class="pname">' + esc(myName()) + '</div>' +
         '<div class="sub" style="margin:0">' + profLine() + '</div></div></div>' +
+        '<h4 class="hd">Ваш рейтинг</h4>' + rtBlock(rtLoad(), true) +
         cloudBox() +
 
         '<h4 class="hd">Как вас звать</h4>' +
@@ -11299,6 +12621,8 @@ var Boot = (function () {
         '. Портреты с <b>синим</b> ободком выданы за достижение, с <b>золотым</b> — за редкое: ' +
         'наведите, и он скажет, за какое. Остальные открываются за игру.</div>' +
 
+        '<h4 class="hd">Колода</h4>' + CARDS.tiles('deck', CFG.deck) +
+        '<h4 class="hd">Рубашка</h4>' + CARDS.tiles('back', CFG.back) +
         '<h4 class="hd">Ваш характер за столом</h4>' +
         '<div class="hint">Вы тоже отпускаете фразочки — они всплывают над вашей рукой. ' +
         'Характер решает, какие именно.</div>' +
@@ -11339,6 +12663,16 @@ var Boot = (function () {
       back: mainMenu, backText: 'Готово'
     }, function (m) {
       m.querySelector('#pName').onchange = function () { setName(this.value); ach('hello'); };
+      m.querySelectorAll('[data-deck],[data-back]').forEach(function (cp) {
+        cp.onclick = function () {
+          if (cp.dataset.locked) return;                       // закрытое — пока не выбрать
+          if (cp.dataset.deck) CFG.deck = cp.dataset.deck; else CFG.back = cp.dataset.back;
+          var got = CARDS.apply(CFG.deck, CFG.back); CFG.deck = got.deck; CFG.back = got.back;
+          saveCfg();
+          try { UI.drawAll(); } catch (e) { }                  // партия идёт — карты перерисуются сразу
+          profile();
+        };
+      });
       m.querySelectorAll('[data-f]').forEach(function (b2) {
         b2.onclick = function () {
           CFG.face = +b2.dataset.f; saveCfg();
@@ -11378,7 +12712,8 @@ var Boot = (function () {
   function exportText() {
     var d = {
       v: 1, name: myName(), face: CFG.face, uid: Net.myUid(),
-      faces: facesOpen(), ach: achList(), stats: stats(), conv: CFG.conv, ch: CFG.myChar
+      faces: facesOpen(), ach: achList(), stats: stats(), conv: CFG.conv, ch: CFG.myChar,
+      rt: rtLoad()
     };
     try { return 'PREF1:' + btoa(unescape(encodeURIComponent(JSON.stringify(d)))); }
     catch (e) { return 'PREF1:' + JSON.stringify(d); }
@@ -11414,6 +12749,10 @@ var Boot = (function () {
     for (k in st) if (typeof ds[k] === 'number' && ds[k] > st[k]) st[k] = ds[k];
     saveStats(st);
 
+    /* Рейтинги СКЛАДЫВАЮТСЯ, а не суммируются: берётся состояние с
+       бо́льшим числом партий, списки партий объединяются, лучшие звёзды —
+       максимум. Иначе перенос профиля удваивал бы наигранное. */
+    if (d.rt) rtSave(Rating.merge(RCFG, rtLoad(), d.rt));
     if (d.conv && K.CONV[d.conv]) CFG.conv = d.conv;
     saveCfg();
     if (quiet) {
@@ -11568,8 +12907,10 @@ var Boot = (function () {
       c.vist + '</i></div>';
     if (c.elo != null) rows += '<div class="mline"><span>рейтинг</span><i class="vw">' +
       c.elo + '</i></div>';
-    if (!rows) return '<div class="sub">Визитка ещё не доехала.</div>';
-    return '<div class="mcard"><b>Визитка</b>' + rows + '</div>';
+    if (!rows && !c.rt) return '<div class="sub">Визитка ещё не доехала.</div>';
+    var me = (window.UI && UI.me) ? UI.me() : 0;
+    return (c.rt ? rtBlock(c.rt, p === me) : '') +
+      (rows ? '<div class="mcard"><b>Визитка</b>' + rows + '</div>' : '');
   }
 
   function showProfile(p) {
@@ -11599,7 +12940,10 @@ var Boot = (function () {
     return { name: myName(), face: CFG.face, games: st.games, wins: st.wins,
       hands: st.hands || 0, net: st.net || 0, netWins: st.netWins || 0,
       vWon: st.vWon || 0, vLost: st.vLost || 0,
-      elo: rating(st), vist: vistNet(st) };
+      elo: rating(st), vist: vistNet(st),
+      /* Состояние рейтинга целиком (≈150 байт): хозяину для расчёта
+         нужна не карточка, а `r`, `rd`, `vol` и список партий. */
+      rt: rtLoad() };
   }
 
 
@@ -11649,13 +12993,19 @@ var Boot = (function () {
           };
           m.querySelector('#nEnd').onclick = function () {
             UI.closeModal();
-            try { Net.closeTable('Хозяин закончил партию — стол закрыт.'); } catch (e) { }
-            netBtn(); mainMenu();
+            /* Закрыть стол посреди пульки — то же, что бросить её.
+               «Отложить» рядом остаётся честным способом уйти: там
+               заявка ждёт продолжения. */
+            rtAskLeave(function () {
+              try { Net.closeTable('Хозяин закончил партию — стол закрыт.'); } catch (e) { }
+              netBtn(); mainMenu();
+            });
           };
           return;
         }
         m.querySelector('#nLeave').onclick = function () {
-          UI.closeModal(); Net.leave(); netBtn(); mainMenu();
+          UI.closeModal();
+          rtAskLeave(function () { Net.leave(); netBtn(); mainMenu(); });
         };
       });
   }
@@ -11676,17 +13026,19 @@ var Boot = (function () {
         G = g;
         G.faces = d.faces || G.faces || null;
         G.lvl = d.lvl || CFG.level;
+        G.mid = (d.game && d.game.mid) || d.mid || rtMid(true);
         G.stats = d.stats || [statCard()];
         if (window.Talk) Talk.reset();
         UI.closeModal(); UI.closeSplash();
         toTable();
         UI.attach(G, [], 0);
         Net.startGame(G);
+        rtStart(G);                          // та же партия — заявка на месте
         Net.holdHumans();                    // люди с прошлого раза — ждём их, ботов не сажаем
         Net.broadcast(G);
         UI.netEvents([]);
         netBtn();
-        if (window.Hall && Hall.table) Hall.table(Net.S.code, d.cfg.N);
+        if (window.Hall && Hall.table) Hall.table(Net.S.code, d.cfg.N, true);
         if (window.Hall && Hall.where) Hall.where('table');
         UI.resume();
         UI.toast('Стол ' + d.code + ' поднят. Игроки возвращаются по кнопке «Вернуться за стол»');
@@ -11721,10 +13073,12 @@ var Boot = (function () {
       ? { razboynik: true, card: (CFG.card === 'full' ? K.CARD_FULL : K.CARD_SHORT) }
       : {}));
     G.faces = faces; G.lvl = CFG.level;
+    G.mid = rtMid(true);                  // номер партии один на стол
     G.stats = [statCard()];
     for (i = 1; i < N; i++) G.stats[i] = (Net.S.conns[i] && Net.S.conns[i].stats) || null;
     if (window.Talk) Talk.reset();
     UI.attach(G, [], 0);
+    rtStart(G);
     Net.startGame(G);
     G.newHand();
     Net.broadcast(G);
@@ -11733,6 +13087,11 @@ var Boot = (function () {
     netBtn();
     toTable();
     if (window.Hall && Hall.where) Hall.where('table');
+    /* И про сам стол: за ним теперь ИГРАЮТ. В комнате он перестаёт
+       быть приглашением — хозяин идущего стола никого нового не
+       посадит, и звать туда значит дразнить. */
+    if (window.Hall && Hall.table && Net.S.on && Net.S.host && Net.S.code)
+      Hall.table(Net.S.code, CFG.players, true);
   }
 
   /* ---------- экран создания стола ---------- */
@@ -11935,7 +13294,9 @@ var Boot = (function () {
         '<div class="row"><button class="btn wide" id="gLeave">Выйти из-за стола</button></div>',
       back: null
     }, function (m) {
-      m.querySelector('#gLeave').onclick = function () { Net.leave(); netBtn(); mainMenu(); };
+      m.querySelector('#gLeave').onclick = function () {
+        rtAskLeave(function () { Net.leave(); netBtn(); mainMenu(); });
+      };
     });
   }
 
@@ -11961,7 +13322,8 @@ var Boot = (function () {
 
   function hallCard() {
     var st = stats();
-    return { games: st.games, wins: st.wins, net: st.net };
+    return { games: st.games, wins: st.wins, net: st.net,
+      rt: Rating.card(RCFG, rtLoad()) };   // звёзды для списка комнаты — без лишнего
   }
 
   /* ---------- комната: колонка справа на КАЖДОМ экране меню ----------
@@ -12066,7 +13428,13 @@ var Boot = (function () {
         '<span class="hname"><b>' + esc(m.name) + '</b>' +
         '<span class="hsub">' + sub.join(' · ') + '</span></span>' +
         (busy && !mine
-          ? '<button class="btn tiny" data-hjoin="' + esc(m.table.code) + '">Подключиться</button>' : '') +
+          /* За столом уже играют — кнопки нет: хозяин такого стола
+             пускает только тех, кто начинал, а прочим отвечает
+             отказом. Пусть видно сразу, а не после стука. */
+          ? (m.table.go
+            ? '<span class="hst">партия идёт</span>'
+            : '<button class="btn tiny" data-hjoin="' + esc(m.table.code) + '">Подключиться</button>')
+          : '') +
         '</div>';
     }).join('');
   }
@@ -12079,9 +13447,15 @@ var Boot = (function () {
       if (x.k === 'sys') return '<div class="hmsg sys">' + esc(x.t) + '</div>';
       if (x.k === 'table') {
         var mine = Hall.S.me.table && Hall.S.me.table.code === x.code;
+        /* Объявление висит в разговоре, а стол за это время мог сесть
+           играть: смотрим на живой список комнаты, а не на старую строку. */
+        var going = Hall.S.members.some(function (q) {
+          return q.table && q.table.code === x.code && q.table.go;
+        });
         return '<div class="hmsg tbl">' + esc(x.t) +
           (mine ? ' <span class="hst">это ваш стол</span>'
-            : ' <button class="btn tiny" data-hjoin="' + esc(x.code) + '">Подключиться</button>') +
+            : going ? ' <span class="hst">партия идёт</span>'
+              : ' <button class="btn tiny" data-hjoin="' + esc(x.code) + '">Подключиться</button>') +
           '</div>';
       }
       return '<div class="hmsg"><b>' + esc(x.from) + '</b> ' + esc(x.t) + '</div>';
@@ -12121,6 +13495,9 @@ var Boot = (function () {
   function hallWhere() {
     if (!window.Hall || !Hall.where) return;
     Hall.where(!atTable() ? 'room' : (window.Net && Net.S && Net.S.on ? 'table' : 'bots'));
+    /* Стола больше нет, а объявление о нём осталось бы висеть в
+       комнате до перезагрузки — с живой кнопкой в никуда. */
+    if (Hall.S.me.table && !(window.Net && Net.S && Net.S.on && Net.S.host)) Hall.table(null);
   }
 
   /* В комнату заходим и во время партии: `enter` при уже поднятой комнате
@@ -12163,14 +13540,14 @@ var Boot = (function () {
       ART.ava(m.face != null ? m.face : -1, (m.name || '?').charAt(0), 'big') +
       '<div><div class="pname">' + esc(m.name) + '</div>' +
       '<div class="sub" style="margin:0">' + who.join(' · ') + '</div></div></div>';
-    var body = c
+    var body = (c && c.rt ? rtBlock(c.rt, mine) : '') + (c
       ? '<div class="mcard">' +
         '<div class="mline"><span>партий</span><i>' + (c.games || 0) + '</i></div>' +
         '<div class="mline"><span>побед</span><i>' + (c.wins || 0) + '</i></div>' +
         '<div class="mline"><span>по сети</span><i>' + (c.net || 0) + '</i></div>' +
         (c.elo != null ? '<div class="mline"><span>рейтинг</span><i class="vw">' + c.elo + '</i></div>' : '') +
         '</div>'
-      : '<div class="sub">Визитка ещё не доехала — человек только что вошёл.</div>';
+      : '<div class="sub">Визитка ещё не доехала — человек только что вошёл.</div>');
     UI.modal(head + body + '<div class="row"><button class="btn" data-x="1">Закрыть</button></div>',
       function (mm) {
         mm.onclick = function (ev) { if (ev.target.closest('[data-x]')) UI.closeModal(); };
@@ -12290,6 +13667,48 @@ var Boot = (function () {
       }, key);
   }
 
+  /* Уход из идущей партии. Человек должен прочитать, чем это кончится:
+     бросить игру теперь то же самое, что проиграть её.
+
+     Нажать «Меню» за столом — это НЕ уход: оттуда возвращаются кнопкой
+     «За стол», и партия всё это время жива. Уход — только там, где
+     стол действительно закрывается: «Покинуть стол», «Закончить партию
+     и закрыть стол», выход из окна «Связь прервалась» и новая партия
+     поверх недоигранной. */
+  function rtAsk(ttl, txt, go2) {
+    UI.modal('<h3>' + ttl + '</h3><div class="sub">' + txt + '</div>' +
+      '<div class="row"><button class="btn wide" data-q="1">Выйти и проиграть</button>' +
+      '<button class="btn pri wide" data-q="0">Доиграть</button></div>',
+      function (m) {
+        m.onclick = function (ev) {
+          var b = ev.target.closest('[data-q]'); if (!b) return;
+          UI.closeModal();
+          if (b.dataset.q !== '1') return;
+          rtQuit();
+          go2();
+        };
+      }, { light: true });
+  }
+  function rtAskLeave(go2) {
+    var p = rtPend();
+    var risky = !!p && (isNet() || !savedGame());
+    if (!risky) return go2();
+    rtAsk('Выйти из партии?',
+      'Пулька не доиграна. Она <b>засчитается поражением</b> — бросить игру ' +
+      'теперь то же самое, что проиграть её. ' +
+      (isNet() ? 'За столом ваше место доиграет бот.' : ''), go2);
+  }
+  /* Новая партия поверх недоигранной. Тут рискует и сохранённая партия
+     с ботами: новая её затрёт, и зачтётся она поражением. */
+  function rtAskNew(go2) {
+    var p = rtPend();
+    if (!p) return go2();
+    rtAsk('Начать новую партию?',
+      'Прошлая пулька не доиграна. Если начать новую, она <b>засчитается ' +
+      'поражением</b>. ' + (!isNet() && savedGame()
+        ? 'Доиграть её можно кнопкой «Продолжить партию» в этом же меню.' : ''), go2);
+  }
+
   function scrHall() { hallTab = 'log'; mainMenu(); }
 
   /* Вид кнопки «Базар» по её состоянию. */
@@ -12318,6 +13737,9 @@ var Boot = (function () {
     });
     talkBtn();
     netBtn();
+    Rating.injectCSS();
+    rtBoot();                 // незаконченная прошлая партия — поражение
+    var got = CARDS.apply(CFG.deck, CFG.back); CFG.deck = got.deck; CFG.back = got.back;
     ART.applySkin && ART.applySkin('felt');
     mainMenu();
   }
@@ -12333,6 +13755,10 @@ var Boot = (function () {
     scrHost: scrHost, scrJoin: scrJoin, scrHall: scrHall, hallCard: hallCard,
     exportText: exportText, importText: importText,
     autosave: autosave, savedGame: savedGame, resumeGame: resumeGame, dropSave: dropSave,
+    RCFG: RCFG, rating: rtLoad, ratingSave: rtSave, ratingStars: rtStars,
+    rtStart: rtStart, rtFinish: rtFinish, rtNet: rtNet, rtQuit: rtQuit, rtPend: rtPend,
+    rtTableGone: rtTableGone, rtBlock: rtBlock, rtLine: rtLine,
+    rtAskLeave: rtAskLeave, rtAskNew: rtAskNew,
     /* Наружу — только для проверок: t_rate.js пересчитывает рейтинг своей
        формулой и раньше держал коэффициент росписи прописью. После
        перемера (`calibk.js`) число разъехалось, и тест поймал самого
