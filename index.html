@@ -2429,8 +2429,31 @@ var ART = (function () {
       '<g' + rot + '>' + PIP[suit] + '</g></g>';
   }
 
+  /* ---------- угол карты ----------
+
+     Ник, 02.11, со скриншота руки: «видно, что на картинках цифры с
+     белым ореолом и выделяются». Так и есть: у старинных колод в углах
+     индексов не было вовсе, и пакет накладывает на фигуры СВОЮ плашку с
+     кириллическим индексом (`index_plate` в `_колоды/_tools/build_pack.py`).
+     А очковые карты игра рисует сама — и рисовала индекс прямо на бумаге,
+     без плашки. В веере выходило через одну: фигура с белым углом, семёрка
+     без. Теперь, когда у колоды есть плашка (`CARDS.plate()`), своя карта
+     получает ровно такую же — та же геометрия, тот же цвет, та же
+     раскладка «буква, справа масть», что и в пакете. */
+  var PLATE = '#fbf7ec';            // цвет плашки из build_pack.py (PAPER)
+  function hasPlate() {
+    try { return typeof CARDS !== 'undefined' && CARDS.plate && CARDS.plate(); } catch (e) { return false; }
+  }
   function corner(rank, suit, col, flip) {
     var t = flip ? ' transform="rotate(180 172 256)"' : '';
+    if (hasPlate()) {
+      var fp = rank === '10' ? 56 : 70;
+      return '<g' + t + '>' +
+        '<rect x="4" y="4" width="128" height="106" rx="12" fill="' + PLATE + '" fill-opacity=".95"/>' +
+        '<text x="38" y="80" text-anchor="middle" fill="' + col +
+        '" font-family="PT Serif,Georgia,serif" font-weight="700" font-size="' + fp + '">' + rank + '</text>' +
+        pip(suit, 96, 57, 54, col) + '</g>';
+    }
     var fs = rank === '10' ? 62 : 78;
     return '<g' + t + '>' +
       '<text x="40" y="80" text-anchor="middle" fill="' + col +
@@ -2952,7 +2975,7 @@ var ART = (function () {
    ============================================================ */
 var CARDS = (function () {
   'use strict';
-  var DECKS = [{"id": "atlas", "t": "Атласная", "y": "классика", "tier": 0, "cards": ["K", "Q", "J"], "aces": false, "base": true}, {"id": "atlas-vector", "t": "Атласная (вектор)", "y": "1911/1920-е, перерисовка", "tier": 1, "cards": ["A", "J", "K", "Q"], "aces": true, "back": "atlas-plaid-blue", "paper": "#ffffff"}, {"id": "lubok-1850", "t": "Лубочная", "y": "сер. XIX в., ручная раскраска", "tier": 2, "cards": ["J", "K", "Q"], "aces": false, "back": "lubok-marble", "paper": "#d6cbb3"}, {"id": "russian-style", "t": "Русский стиль (боярская)", "y": "ок. 1900", "tier": 2, "cards": ["A", "J", "K", "Q"], "aces": false, "back": "dondorf-russian", "paper": "#e5e0ce"}, {"id": "luxe-1860", "t": "Двухголовая «люкс»", "y": "сер. XIX в.", "tier": 3, "cards": ["J", "K", "Q"], "aces": false, "back": "luxe-1860", "paper": "#eae7db"}, {"id": "louis-xv", "t": "Стиль Людовика XV", "y": "кон. XIX в.", "tier": 3, "cards": ["A", "J", "K", "Q"], "aces": true, "back": "louis-xv", "paper": "#dfdad2"}];
+  var DECKS = [{"id": "atlas", "t": "Атласная", "y": "классика", "tier": 0, "cards": ["K", "Q", "J"], "aces": false, "base": true, "plate": false}, {"id": "atlas-vector", "t": "Атласная (вектор)", "y": "1911/1920-е, перерисовка", "tier": 1, "cards": ["A", "J", "K", "Q"], "aces": true, "back": "atlas-plaid-blue", "paper": "#ffffff", "plate": false}, {"id": "lubok-1850", "t": "Лубочная", "y": "сер. XIX в., ручная раскраска", "tier": 2, "cards": ["J", "K", "Q"], "aces": false, "back": "lubok-marble", "paper": "#d6cbb3", "plate": true}, {"id": "russian-style", "t": "Русский стиль (боярская)", "y": "ок. 1900", "tier": 2, "cards": ["A", "J", "K", "Q"], "aces": false, "back": "dondorf-russian", "paper": "#e5e0ce", "plate": true}, {"id": "luxe-1860", "t": "Двухголовая «люкс»", "y": "сер. XIX в.", "tier": 3, "cards": ["J", "K", "Q"], "aces": false, "back": "luxe-1860", "paper": "#eae7db", "plate": true}, {"id": "louis-xv", "t": "Стиль Людовика XV", "y": "кон. XIX в.", "tier": 3, "cards": ["A", "J", "K", "Q"], "aces": true, "back": "louis-xv", "paper": "#dfdad2", "plate": true}];
   var BACKS = [{"id": "atlas", "t": "Атласная клетка", "y": "классика", "tier": 0, "base": true}, {"id": "atlas-1sort", "t": "Атласная, 1-й сорт", "y": "1920-е", "tier": 0}, {"id": "atlas-plaid-green", "t": "Атласная, клетка (зелёно-красная)", "y": "1920-е, перерисовка", "tier": 0}, {"id": "atlas-plaid-blue", "t": "Атласная, клетка (сине-коричневая)", "y": "1920-е, перерисовка", "tier": 0}, {"id": "rosette-red", "t": "Розетка красная", "y": "традиционный рисунок", "tier": 0}, {"id": "rosette-blue", "t": "Розетка синяя", "y": "традиционный рисунок", "tier": 0}, {"id": "modern-red", "t": "Ромбы красные", "y": "современная", "tier": 0}, {"id": "modern-blue", "t": "Ромбы синие", "y": "современная", "tier": 0}, {"id": "dondorf-russian", "t": "Dondorf «Русский стиль»", "y": "кон. XIX в.", "tier": 1}, {"id": "grimaud-plaid", "t": "Grimaud, клетка", "y": "1860", "tier": 1}, {"id": "grimaud-aluette", "t": "Grimaud, узор", "y": "1858–1890", "tier": 1}, {"id": "polish-berlin", "t": "Берлинский узор, синяя", "y": "XIX в.", "tier": 1}, {"id": "ua-vyshyvanka-red", "t": "Вышиванка, красная", "y": "2026", "tier": 1}, {"id": "ua-vyshyvanka-blue", "t": "Вышиванка, синяя", "y": "2026", "tier": 1}, {"id": "ua-vyshyvanka-black", "t": "Вышиванка, чёрная", "y": "2026", "tier": 1}, {"id": "dodal-pink", "t": "Додаль, розовая", "y": "нач. XVIII в.", "tier": 1}, {"id": "napoli-cubes", "t": "Неаполитанская, кубы", "y": "XIX в.", "tier": 1}, {"id": "piedmont-1865", "t": "Пьемонтская", "y": "1865", "tier": 1}, {"id": "roman-leone", "t": "Римская «Al Leone»", "y": "XVIII в.", "tier": 1}, {"id": "ua-rushnyk", "t": "Рушник", "y": "2026", "tier": 1}, {"id": "minchiate-1870", "t": "Флорентийская", "y": "1860–1890", "tier": 1}, {"id": "swiss-1850", "t": "Швейцарская, звёзды", "y": "1850", "tier": 1}, {"id": "atlas-extra", "t": "Атласная «экстра»", "y": "1910-е", "tier": 2}, {"id": "ua-petrykivka-cream", "t": "Петриковка, светлая", "y": "2026", "tier": 2}, {"id": "ua-petrykivka-black", "t": "Петриковка, чёрная", "y": "2026", "tier": 2}, {"id": "ua-pysanka-red", "t": "Писанка, красная", "y": "2026", "tier": 2}, {"id": "ua-pysanka-black", "t": "Писанка, чёрная", "y": "2026", "tier": 2}, {"id": "lubok-marble", "t": "Рубашка колоды «Лубочная»", "y": "сер. XIX в., ручная раскраска", "tier": 2}, {"id": "fantasy-gold", "t": "Фэнтези", "y": "современная", "tier": 2}, {"id": "swiss-lausanne", "t": "Швейцарская, Лозанна", "y": "ок. 1900", "tier": 2}, {"id": "ua-kozak-crimson", "t": "Казацкая, малиновая", "y": "2026", "tier": 3}, {"id": "ua-kozak-blue", "t": "Казацкая, синяя", "y": "2026", "tier": 3}, {"id": "yellowbook-flowers", "t": "Модерн I", "y": "1894", "tier": 3}, {"id": "yellowbook-lilies", "t": "Модерн II", "y": "1894", "tier": 3}, {"id": "yellowbook-hares", "t": "Модерн III", "y": "1894", "tier": 3}, {"id": "yellowbook-birds", "t": "Модерн IV", "y": "1894", "tier": 3}, {"id": "luxe-1860", "t": "Рубашка колоды «Двухголовая «люкс»»", "y": "сер. XIX в.", "tier": 3}, {"id": "louis-xv", "t": "Рубашка колоды «Стиль Людовика XV»", "y": "кон. XIX в.", "tier": 3}];
   var SUITS = ['S', 'H', 'D', 'C'];
 
@@ -3010,6 +3033,11 @@ var CARDS = (function () {
   // Цвет бумаги выбранной колоды — им рисуются очковые карты, чтобы не спорили с фигурами.
   // null — колода базовая, рисуем своим цветом.
   function paper() { var d = deck(cur.deck); return d && d.paper || null; }
+  /* Есть ли на фигурах этой колоды наша плашка с индексом. У старинных колод
+     в углах индексов не было, и пакет накладывает их сам; игра по этому
+     признаку рисует такую же плашку на своих очковых картах, чтобы веер читался
+     одинаково, а не половиной карт с белым углом. */
+  function plate() { var d = deck(cur.deck); return !!(d && d.plate); }
 
   // ---------- плитки для окна настроек ----------
   // Те же классы, что у выбора сукна (.skins / .skin / .on), плюс .locked.
@@ -3034,7 +3062,7 @@ var CARDS = (function () {
   }
 
   return { DECKS: DECKS, BACKS: BACKS, setRule: setRule, isOpen: isOpen, deck: deck, back: back,
-    apply: apply, current: current, paper: paper, single: SINGLE, tiles: tiles, count: count, cardUrl: cardUrl, backUrl: backUrl };
+    apply: apply, current: current, paper: paper, plate: plate, single: SINGLE, tiles: tiles, count: count, cardUrl: cardUrl, backUrl: backUrl };
 })();
 
 /* ============================================================
@@ -11048,7 +11076,10 @@ var Cloud = (function () {
   };
   var SDK = 'https://www.gstatic.com/firebasejs/10.12.2/firebase-';
   var ON = 'pref-cloud-on';
-  var C = { user: null, state: 'off', err: '', at: 0, owner: false, kicked: false, kickFrom: '', busy: false };
+  /* `at` — когда последний раз ОТПРАВИЛИ, `got` — когда последний раз
+     ПОДТЯНУЛИ облачный профиль. Второе игроку важнее: по нему видно,
+     слился профиль с другого устройства или ещё нет. */
+  var C = { user: null, state: 'off', err: '', at: 0, got: 0, owner: false, kicked: false, kickFrom: '', busy: false };
   var listeners = [];
   function emit() { listeners.forEach(function (f) { try { f(C); } catch (e) { } }); }
   function ls(k, v) {
@@ -11140,8 +11171,12 @@ var Cloud = (function () {
     return pRef().get().then(function (snap) {
       var d = snap.data();
       if (d && d.text) {
-        try { (function (r) { if (!r.ok) throw new Error(r.why); })(Boot.importText(d.text, true)); } catch (e) { C.err = 'облачный профиль не читается: ' + (e.message || e); }
-      }
+        try {
+          (function (r) { if (!r.ok) throw new Error(r.why); })(Boot.importText(d.text, true));
+          C.got = Date.now();
+        } catch (e) { C.err = 'облачный профиль не читается: ' + (e.message || e); }
+      } else C.got = Date.now();            // в облаке пусто — но спросили и ответ получили
+      emit();
       return push();
     });
   }
@@ -11190,7 +11225,13 @@ var Cloud = (function () {
       .then(function (s) { var d = s.data(); if (!d || d.releasedPrev || d.id !== SID) return; return waitPrev(n - 1); });
   }
   window.addEventListener('pagehide', function () {
-    if (C.owner && C.user) { try { sRef().update({ released: true }); } catch (e) { } }
+    if (!C.owner || !C.user) return;
+    /* Раньше тут только отпускался замок сессии, а профиль не
+       отправлялся: отправка висела на проверке раз в пять секунд.
+       Закрыл вкладку сразу после пульки — она не уезжала. Найдено в
+       клаборе 02.11; шанс, что запрос успеет, невелик, но бесплатный. */
+    try { if (print() !== sent) push(); } catch (e) { }
+    try { sRef().update({ released: true }); } catch (e) { }
   });
 
   /* ---------- окно «играют на другом устройстве» ---------- */
@@ -11227,7 +11268,13 @@ var Cloud = (function () {
   }
 
   // был вход раньше — поднимаемся сами
-  if (ls(ON)) setTimeout(function () { load().catch(function (e) { C.err = msg(e); emit(); }); }, 400);
+  /* Пока Firebase качается и авторизуется (легко 5–10 секунд), профиль
+     обязан говорить, что облако на подходе: иначе человек открывает
+     профиль, видит местные цифры и решает, что не синхронизировалось. */
+  if (ls(ON)) setTimeout(function () {
+    C.state = 'wait'; emit();
+    load().catch(function (e) { C.err = msg(e); C.state = 'off'; emit(); });
+  }, 400);
 
   C.on = function (f) { listeners.push(f); };
   /* select_account: Google каждый раз спрашивает, каким аккаунтом войти, —
@@ -11270,7 +11317,7 @@ var Boot = (function () {
      в клаборе: чтобы с одного взгляда было видно, КАКАЯ версия сейчас
      открыта. Без него легко час спорить, почему правка «не работает»,
      когда на самом деле открыта старая заливка. */
-  var BUILD = '31.10 22:32';
+  var BUILD = '02.11 11:49';
 
   function ls(k, d) {
     try { var v = localStorage.getItem('pref-' + k); return v == null ? d : v; } catch (e) { return d; }
@@ -12520,6 +12567,8 @@ var Boot = (function () {
         '<div class="hint">Профиль хранится в облаке и одинаков на всех устройствах, где вы вошли этим же ' +
         'входом, — и в «Колдовстве» с «Клабором» вход тот же. Играть под одним входом можно только в одном месте: ' +
         'откроете игру на другом устройстве — здесь она остановится.' +
+        (C.got ? ' Профиль из облака подтянут в ' + new Date(C.got).toTimeString().slice(0, 5) + '.'
+          : ' Профиль из облака ещё не подтянут — подождите несколько секунд.') +
         (C.at ? ' Последнее сохранение в облако — ' + new Date(C.at).toTimeString().slice(0, 5) + '.' : '') + '</div>' +
         '<div class="row"><button class="btn wide" data-m="cl-out">Выйти из профиля</button></div>';
     } else {
